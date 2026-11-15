@@ -16,6 +16,12 @@ app (:mod:`stadiacast.ojd_gamepad`) and is closed when its controller goes away.
 through the kernel's uinput (:mod:`stadiacast.uinput_gamepad`). It is removed when its controller
 goes away, as a wireless pad is when it is switched off.
 
+``--gamepad uhid`` is the Linux pad as a wired Stadia Controller instead of an Xbox 360 pad: a HID
+device the receiver creates through the kernel's uhid (:mod:`stadiacast.uhid_gamepad`), which
+Steam and SDL drive with their Stadia support, Assistant and Capture included. A backend like it,
+which needs more than XInput's fields, says so with ``takes_state`` and is given the whole
+:class:`~stadiacast.gamepad.GamepadState`.
+
 :class:`PadBackend` is the small surface the receiver drives, so the tests run the same code
 against a fake pad on every platform.
 """
@@ -32,6 +38,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 from stadiacast.errors import SetupError
 from stadiacast.gamepad import XINPUT_LEFT_DEADZONE, XINPUT_RIGHT_DEADZONE, GamepadState
 from stadiacast.ojd_gamepad import OJDPad, find_ojd
+from stadiacast.uhid_gamepad import UhidPad
+from stadiacast.uhid_gamepad import check_available as check_uhid_available
 from stadiacast.uinput_gamepad import UinputPad, check_available
 
 if TYPE_CHECKING:
@@ -265,8 +273,11 @@ class VirtualGamepads:
         if cfg.gamepad == "uinput":
             check_available()  # the wrong system, no uinput, or no right to open it: said at start
             return cls(cfg, log, rx, UinputPad, kind="uinput", per_boot=True)
+        if cfg.gamepad == "uhid":
+            check_uhid_available()  # the same for uhid
+            return cls(cfg, log, rx, UhidPad, kind="uhid", per_boot=True)
         if cfg.gamepad != "vigem":
-            raise ValueError(f"unknown --gamepad {cfg.gamepad!r}; use off, vigem, ojd or uinput")
+            raise ValueError(f"unknown --gamepad {cfg.gamepad!r}; use off, vigem, ojd, uinput or uhid")
         if sys.platform != "win32":
             raise SetupError("--gamepad vigem is Windows only: it drives the ViGEmBus driver through vgamepad")
         try:
@@ -313,7 +324,11 @@ class VirtualGamepads:
 
     def _apply(self, label: str, pad: PadBackend, state: GamepadState) -> None:
         try:
-            pad.apply(state.to_xinput(*self._dz))
+            apply_state = getattr(pad, "apply_state", None) if getattr(pad, "takes_state", False) else None
+            if apply_state is not None:
+                apply_state(state.deadzoned(*self._dz))
+            else:
+                pad.apply(state.to_xinput(*self._dz))
         except SetupError as e:  # the pad's own word that it is done: a feed that ended or cannot keep up
             self._backend_failed(label, pad, str(e))
             return
@@ -395,7 +410,7 @@ class VirtualGamepads:
         if on_error is not None:
             on_error(lambda error: loop.call_soon_threadsafe(self._backend_failed, label, pad, error))
         created: dict[str, Any] = {"kind": self.kind, "slot": pad.slot, "deadzone": self.cfg.gamepad_deadzone}
-        if self.kind == "uinput":
+        if self.kind in ("uinput", "uhid"):
             created["device"] = getattr(pad, "device", None)
         self.log("gamepad_created", controller=label, **created)
         self.rx.live_changed()
@@ -493,9 +508,9 @@ class VirtualGamepads:
         if self.kind == "ojd":
             for value in out.values():
                 value.update(kind="ojd", profile=self.cfg.gamepad_profile)
-        if self.kind == "uinput":
+        if self.kind in ("uinput", "uhid"):
             for label, value in out.items():
-                value.update(kind="uinput")
+                value.update(kind=self.kind)
                 if label in self._pads:
                     value.update(device=getattr(self._pads[label], "device", None))
         return out

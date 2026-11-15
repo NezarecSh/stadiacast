@@ -280,10 +280,11 @@ def build_parser(preset: str | None = None) -> argparse.ArgumentParser:
     g = ap.add_argument_group("virtual gamepad")
     g.add_argument(
         "--gamepad",
-        choices=("off", "vigem", "ojd", "uinput"),
+        choices=("off", "vigem", "ojd", "uinput", "uhid"),
         default="off",
         help="feed input to a virtual pad, one per controller (vigem: Windows; ojd: macOS OpenJoystickDriver; "
-        "uinput: Linux); switches StartGame on so the game's rumble reaches the controller",
+        "uinput: Linux, an Xbox 360 pad; uhid: Linux, a wired Stadia Controller with Assistant and Capture, "
+        "for Steam and SDL); switches StartGame on so the game's rumble reaches the controller",
     )
     g.add_argument(
         "--gamepad-deadzone",

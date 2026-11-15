@@ -288,6 +288,35 @@ the pad as force feedback, comes back to the controller through the game session
 `--gamepad` starts for that reason. Every controller is a pad of its own, and `/_status` lists
 them under `gamepads` with their event device.
 
+### Virtual Stadia Controller (Linux)
+
+`--gamepad uhid` makes each controller a wired Stadia Controller instead, through the kernel's
+uhid device: a HID device with the controller's USB ids (`18d1:9400`) and its report layout.
+Steam and SDL drive it with their own Stadia support, which keeps the **Assistant** and
+**Capture** buttons (SDL's `misc2` and `misc1`) that an Xbox pad has no place for, and send its
+rumble back to the controller. Programs that read input devices directly get an event device
+too, with Assistant and Capture on `BTN_TRIGGER_HAPPY1` and `BTN_TRIGGER_HAPPY2`.
+
+```sh
+stadiacast --preset live --dns-upstream 192.168.1.1 --gamepad uhid --gamepad-deadzone off
+```
+
+Steam applies deadzones of its own, hence `--gamepad-deadzone off`. Two device files need
+rights that most systems give root alone: `/dev/uhid` for the receiver, and the pad's `hidraw`
+node for Steam. These rules give the first to the `input` group (put the receiver's user in it,
+which works with nobody logged in) and the second to whoever sits at the computer, as Steam's
+own rules do for the controllers they know:
+
+```sh
+sudo tee /etc/udev/rules.d/60-stadiacast-uhid.rules <<'EOF'
+KERNEL=="uhid", SUBSYSTEM=="misc", MODE="0660", GROUP="input", OPTIONS+="static_node=uhid"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="0003:18D1:9400.*", TAG+="uaccess"
+EOF
+sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=uhid
+```
+
+`/_status` lists each pad's `hidraw` node as its `device`.
+
 ## Development
 
 ```sh

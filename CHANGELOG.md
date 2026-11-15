@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- A virtual Stadia Controller on Linux: `--gamepad uhid` turns each controller into a wired
+  Stadia Controller (USB `18d1:9400`) instead of an Xbox 360 pad, through the kernel's uhid
+  device. Steam and SDL drive it with their own Stadia support, which keeps the Assistant and
+  Capture buttons that an Xbox pad has no place for, and send its rumble back to the
+  controller. Opening `/dev/uhid` and the pad's `hidraw` node takes the udev rule in the
+  README.
+
 ## [1.2.0] - 2026-11-11
 
 A virtual gamepad on Linux, the controllers' live state as a document and as events for other

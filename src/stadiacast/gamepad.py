@@ -22,7 +22,7 @@ from __future__ import annotations
 import enum
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 
@@ -137,6 +137,13 @@ class GamepadState:
         pressed = [b for b in range(32) if delta & self.buttons & (1 << b)]
         released = [b for b in range(32) if delta & before & (1 << b)]
         return pressed, released
+
+    def deadzoned(self, left_deadzone: int = 0, right_deadzone: int = 0) -> GamepadState:
+        """This state with the radial deadzones of :meth:`to_xinput` applied to the sticks, for a
+        backend that takes the whole state."""
+        lx, ly = radial_deadzone(self.lx, self.ly, left_deadzone)
+        rx, ry = radial_deadzone(self.rx, self.ry, right_deadzone)
+        return replace(self, lx=lx, ly=ly, rx=rx, ry=ry)
 
     def to_xinput(self, left_deadzone: int = 0, right_deadzone: int = 0) -> dict[str, int]:
         """The XInput ``XINPUT_GAMEPAD`` field set.  Stadia maps to the guide bit;
