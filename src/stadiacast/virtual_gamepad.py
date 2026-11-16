@@ -245,7 +245,7 @@ class VirtualGamepads:
         self.rx = rx
         self.kind = kind
         #: A pad lives for one boot of its controller and is closed when the controller goes away
-        #: (an OJD feed is one of four, a uinput pad is made in no time), where a ViGEm pad, which
+        #: (an OJD feed is one of four, a Linux pad is made in no time), where a ViGEm pad, which
         #: takes seconds to create, stays and is only let go of.
         self._per_boot = per_boot
         self._factory = backend_factory
@@ -472,9 +472,9 @@ class VirtualGamepads:
         await asyncio.gather(*list(self._closing), return_exceptions=True)
 
     def _close_pad(self, label: str, pad: PadBackend) -> asyncio.Task[None] | None:
-        """Close a pad. One whose ``close`` waits (``close_blocks``: a feed process to see out) is
-        closed in a worker thread, and the task that follows it is returned: the event loop it
-        would hold up carries every controller's traffic."""
+        """Close a pad. One whose ``close`` waits (``close_blocks``: a feed process to see out, a
+        device for the kernel to remove) is closed in a worker thread, and the task that follows
+        it is returned: the event loop it would hold up carries every controller's traffic."""
         if getattr(pad, "close_blocks", False):
             try:
                 loop = asyncio.get_running_loop()

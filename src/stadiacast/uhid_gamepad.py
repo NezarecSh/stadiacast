@@ -404,6 +404,10 @@ class UhidPad:
     #: Takes the whole :class:`GamepadState` (:meth:`apply_state`): XInput's fields have no room for
     #: the Assistant and Capture buttons.
     takes_state = True
+    #: Closing the uhid file is what removes the device, and the kernel takes a tenth of a second
+    #: or more over it: :class:`~stadiacast.virtual_gamepad.VirtualGamepads` closes the pad in a
+    #: worker thread.
+    close_blocks = True
     #: How long the kernel may take to start the device after it is created.
     START_TIMEOUT = 5.0
     #: The state is written again this often while nothing changes (seconds): see

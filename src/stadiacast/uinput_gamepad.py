@@ -373,6 +373,10 @@ class UinputPad:
     the event loop to come round to it."""
 
     slot: int | None = None  # Linux has no XInput player slot
+    #: Closing the uinput file is what removes the device, and the kernel takes up to a tenth of a
+    #: second over it: :class:`~stadiacast.virtual_gamepad.VirtualGamepads` closes the pad in a
+    #: worker thread.
+    close_blocks = True
     # Declared here because a type checker on another system does not read past the first lines
     # of __init__.
     label: str

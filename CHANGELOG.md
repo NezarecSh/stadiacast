@@ -14,6 +14,10 @@ All notable changes to this project are documented here. The format follows
   controller. Opening `/dev/uhid` and the pad's `hidraw` node takes the udev rule in the
   README.
 
+### Fixed
+- On Linux, a controller that was switched off held up the other controllers and the headset
+  stream for about a tenth of a second, while the kernel removed its pad.
+
 ## [1.2.0] - 2026-11-11
 
 A virtual gamepad on Linux, the controllers' live state as a document and as events for other
