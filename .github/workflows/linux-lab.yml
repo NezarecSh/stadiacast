@@ -2,12 +2,14 @@ name: Linux lab
 
 # The Linux-only paths against the real thing, by hand: the uinput device `--gamepad uinput`
 # creates, read back through its event device as a game reads it, a game's force feedback, the
-# whole path from the lab controller to the pad and back to its motors, and `--audio-source
-# system` recording a tone from a PulseAudio server. With ffmpeg installed, the audio tests that
-# the regular CI skips run here too. Nothing is released.
+# whole path from the lab controller to the pad and back to its motors, the HID device
+# `--gamepad uhid` creates, and `--audio-source system` recording a tone from a PulseAudio
+# server. With ffmpeg installed, the audio tests that the regular CI skips run here too. Nothing
+# is released.
 #
-# The pad tests need a kernel with uinput. Where a runner's kernel has none, the step that
-# prepares it says so and they skip; point `runner` at a self-hosted Linux machine then.
+# The pad tests need a kernel with uinput, and the Stadia pad's one with uhid. Where a runner's
+# kernel has none, the step that prepares it says so and they skip; point `runner` at a
+# self-hosted Linux machine then.
 
 on:
   workflow_dispatch:
@@ -39,27 +41,36 @@ jobs:
           pulseaudio --start --exit-idle-time=-1
           pactl info | grep -E "Server Name|Default Sink|Default Source"
 
-      - name: give the runner's user uinput and the pads it creates
+      - name: give the runner's user uinput, uhid and the pads they create
         run: |
           uname -r
-          if [ ! -e /dev/uinput ]; then
+          if [ ! -e /dev/uinput ] || ! sudo modprobe uhid; then
             sudo modprobe uinput || sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
             sudo modprobe uinput || true
+            sudo modprobe uhid || true
           fi
           # The job has no login session with a seat, so the rules name a mode instead of the tag
           # the README gives a person at the computer.
           {
             echo 'KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0666", OPTIONS+="static_node=uinput"'
+            echo 'KERNEL=="uhid", SUBSYSTEM=="misc", MODE="0666", OPTIONS+="static_node=uhid"'
+            echo 'KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="0003:18D1:9400.*", MODE="0666"'
             echo 'SUBSYSTEM=="input", KERNEL=="event*", MODE="0666"'
           } | sudo tee /etc/udev/rules.d/99-stadiacast-lab.rules
           sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=uinput || true
+          sudo udevadm trigger --name-match=uinput --name-match=uhid || true
           sleep 1
           if [ -c /dev/uinput ]; then
             ls -l /dev/uinput
             echo "STADIACAST_LINUX_LAB=1" >> "$GITHUB_ENV"
           else
             echo "::warning::this runner's kernel has no uinput device: the lab tests skip"
+          fi
+          if [ -c /dev/uhid ]; then
+            ls -l /dev/uhid
+            modinfo -F filename hid-google-stadiaff || echo "no hid-google-stadiaff: the pad stays with hid-generic"
+          else
+            echo "::warning::this runner's kernel has no uhid device: the Stadia pad's lab tests skip"
           fi
 
       - name: the whole test suite, with the pad on a real kernel where there is one
@@ -79,5 +90,24 @@ jobs:
           print("event device:", pad.device)
           print(open("/proc/bus/input/devices").read().split("\n\n")[-2])
           print(subprocess.run(["udevadm", "info", str(pad.device)], capture_output=True, text=True).stdout)
+          pad.close()
+          PY
+
+      - name: what the kernel and udev make of a Stadia pad
+        if: env.STADIACAST_LINUX_LAB == '1'
+        run: |
+          [ -w /dev/uhid ] || { echo "no uhid to write to"; exit 0; }
+          uv run python - <<'PY'
+          import subprocess, time
+          from stadiacast.gamepad import GamepadState
+          from stadiacast.uhid_gamepad import UhidPad
+
+          pad = UhidPad("lab")
+          pad.apply_state(GamepadState())
+          time.sleep(1)
+          print("hidraw node:", pad.device)
+          print(open("/proc/bus/input/devices").read().split("\n\n")[-2])
+          print(subprocess.run(["udevadm", "info", str(pad.device)], capture_output=True, text=True).stdout)
+          print(subprocess.run("dmesg | tail -5", shell=True, capture_output=True, text=True).stdout)
           pad.close()
           PY
