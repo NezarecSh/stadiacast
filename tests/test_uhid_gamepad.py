@@ -11,6 +11,8 @@ import socket
 import struct
 import sys
 import threading
+import time
+from collections.abc import Callable, Iterator
 from typing import Any, ClassVar
 
 import pytest
@@ -47,6 +49,13 @@ from stadiacast.uhid_gamepad import (
 )
 from stadiacast.virtual_gamepad import VirtualGamepads
 from tests.helpers import connect_firmware_flow, make_receiver, single, wait_for
+
+
+def wait_until(cond: Callable[[], bool], timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not cond():
+        assert time.monotonic() < deadline, "condition not met in time"
+        time.sleep(0.01)
 
 
 # ---- the kernel's event layout ----------------------------------------------------------------
@@ -305,6 +314,11 @@ def _reply(event: bytes) -> tuple[int, int, int]:
     return struct.unpack_from("=IIH", event)
 
 
+def _plain(kind: int) -> bytes:
+    """An event that is its type alone, as the kernel hands it out: start, stop, open, close."""
+    return struct.pack("=I", kind).ljust(EVENT_SIZE, b"\0")
+
+
 def test_rumble_is_output_report_5_with_the_strong_motor_first():
     assert rumble_levels(b"\x05\x00\x80\xff\x00") == (0x8000, 0x00FF)
     assert rumble_levels(b"\x05\x00\x80\xff") is None  # cut short
@@ -332,18 +346,28 @@ def test_a_set_report_sets_the_motors_and_is_answered_with_its_id():
     assert requests.levels == (0xFF00, 0x1000)
 
 
-def test_a_get_report_is_refused_and_the_device_state_is_followed():
+def test_a_get_report_is_refused_and_the_starts_are_counted():
     requests = Requests()
     reply = requests.handle(struct.pack("=IIBB", UHID_GET_REPORT, 5, 3, UHID_FEATURE_REPORT))
     assert reply is not None and struct.unpack_from("=IIHH", reply) == (UHID_GET_REPORT_REPLY, 5, errno.EIO, 0)
-    assert not requests.started and not requests.opened
-    for kind in (UHID_START, UHID_OPEN):
-        assert requests.handle(struct.pack("=I", kind)) is None
-    assert requests.started and requests.opened
-    for kind in (UHID_CLOSE, UHID_STOP):
-        requests.handle(struct.pack("=I", kind))
-    assert not requests.started and not requests.opened
+    assert requests.starts == 0
+    for kind in (UHID_START, UHID_OPEN, UHID_CLOSE, UHID_STOP, UHID_START, UHID_OPEN):
+        assert requests.handle(_plain(kind)) is None
+    assert requests.starts == 2  # once for each driver that took the device
     assert requests.handle(b"") is None  # nothing to read: nothing done
+
+
+@pytest.mark.parametrize("kind", [UHID_CLOSE, UHID_STOP])
+def test_the_motors_stop_when_nobody_is_left_to_stop_them(kind):
+    """A program that ends while its rumble runs never sends the report that stops it. The kernel
+    says when the last one has closed the pad's nodes, and when a driver lets go of the device."""
+    requests = Requests()
+    requests.handle(_output(b"\x05\xff\xff\x00\x80"))
+    assert requests.levels == (0xFFFF, 0x8000)
+    requests.handle(_plain(UHID_OPEN))  # another one opening changes nothing
+    assert requests.levels == (0xFFFF, 0x8000)
+    requests.handle(_plain(kind))
+    assert requests.levels == (0, 0)
 
 
 # ---- the device ------------------------------------------------------------------------------
@@ -385,31 +409,70 @@ def test_the_hidraw_node_is_found_by_the_pads_physical_path(tmp_path):
     assert find_hidraw("stadiacast/c9", str(tmp_path)) is None
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="a datagram socket pair as wide as an event")
-def test_the_pad_waits_for_its_start_answers_on_its_thread_and_reports(monkeypatch):
-    """The whole pad against a socket pair that plays the kernel: the device is created and
-    started, a SET_REPORT is answered and its rumble handed on, a hidraw write too, input becomes
-    INPUT2 events, and closing the file is the end of it."""
-    kernel, ours = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    os.set_blocking(ours.fileno(), False)
-    fd = os.dup(ours.fileno())
-    ours.close()
+@pytest.fixture
+def kernel(monkeypatch) -> Iterator[socket.socket]:
+    """A socket pair in place of ``/dev/uhid``: the test holds the kernel's end and the pad opens
+    the other. A sequenced-packet socket keeps each event whole, as the kernel's file does."""
+    ours_end, pads_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    os.set_blocking(pads_end.fileno(), False)
+    fd = os.dup(pads_end.fileno())
+    pads_end.close()
     monkeypatch.setattr(uhid, "open_uhid", lambda: fd)
-    monkeypatch.setattr(uhid, "find_hidraw", lambda phys, _root="": "/dev/hidraw9" if phys == "stadiacast/c0" else None)
-    kernel.settimeout(5)
+    monkeypatch.setattr(uhid, "find_hidraw", lambda phys, _root="": "/dev/hidraw9" if phys == PHYS else None)
+    ours_end.settimeout(5)
+    try:
+        yield ours_end
+    finally:
+        ours_end.close()
 
+
+#: The physical path of the pad these tests make, by which its nodes are found.
+PHYS = f"stadiacast/{os.getpid()}/c0"
+
+
+def _create_pad(kernel: socket.socket) -> uhid.UhidPad:
+    """A pad made the way the receiver makes one, with the kernel's part played: it sends its
+    create event and is ready once it is told the device has started."""
     made: list[uhid.UhidPad] = []
     creating = threading.Thread(target=lambda: made.append(uhid.UhidPad("c0")))
     creating.start()
     create = kernel.recv(EVENT_SIZE * 2)
     assert len(create) == EVENT_SIZE and struct.unpack_from("=I", create) == (UHID_CREATE2,)
-    assert create[4:40] == b"Google LLC Stadia Controller rev. A\0" and create[132:145] == b"stadiacast/c0"
+    assert create[4:40] == b"Google LLC Stadia Controller rev. A\0"
+    assert create[132:196].rstrip(b"\0") == PHYS.encode()  # the pad's own: this process, this controller
     assert struct.unpack_from("=II", create, 264) == (0x18D1, 0x9400)
     creating.join(0.2)
-    assert creating.is_alive()  # no input before the kernel has started the device
-    kernel.send(struct.pack("=I", UHID_START).ljust(EVENT_SIZE, b"\0"))
+    assert creating.is_alive()  # nothing before a driver has taken the device
+    kernel.send(_plain(UHID_START))
     creating.join(5)
     (pad,) = made
+    return pad
+
+
+def _reports(kernel: socket.socket, wanted: int, within: float = 3.0) -> list[bytes]:
+    """The next ``wanted`` different input reports the pad writes; one written again counts once."""
+    seen: list[bytes] = []
+    deadline = time.monotonic() + within
+    while len(seen) < wanted:
+        kernel.settimeout(max(0.01, deadline - time.monotonic()))
+        event = kernel.recv(EVENT_SIZE * 2)
+        assert struct.unpack_from("=IH", event) == (UHID_INPUT2, 10)
+        if not seen or event[6:16] != seen[-1]:
+            seen.append(event[6:16])
+    return seen
+
+
+linux_only = pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="a socket pair that keeps each event whole, as Linux has it"
+)
+
+
+@linux_only
+def test_the_pad_waits_for_its_start_answers_on_its_thread_and_reports(kernel):
+    """The whole pad against a socket pair that plays the kernel: the device is created and
+    started, a SET_REPORT is answered and its rumble handed on, a hidraw write too, input becomes
+    INPUT2 events, and closing the file is the end of it."""
+    pad = _create_pad(kernel)
     assert pad.device == "/dev/hidraw9"
 
     levels: list[tuple[int, int]] = []
@@ -417,25 +480,118 @@ def test_the_pad_waits_for_its_start_answers_on_its_thread_and_reports(monkeypat
     kernel.send(_set_report(7, b"\x05\x00\x80\x00\x40"))
     reply = kernel.recv(EVENT_SIZE * 2)
     assert _reply(reply) == (UHID_SET_REPORT_REPLY, 7, 0)
+    wait_until(lambda: levels == [(0x80, 0x40)])  # one level at a time: the pad hands on the newest
     kernel.send(_output(b"\x05\x00\x00\x00\x00"))
-    deadline = 50
-    while len(levels) < 2 and deadline:
-        threading.Event().wait(0.02)
-        deadline -= 1
-    assert levels == [(0x80, 0x40), (0, 0)]
+    wait_until(lambda: levels == [(0x80, 0x40), (0, 0)])
 
     pad.apply_state(GamepadState(buttons=int(Button.ASSISTANT)))
     pad.apply_state(GamepadState(buttons=int(Button.ASSISTANT)))  # nothing changed: nothing written
     pad.reset()
-    sent = [kernel.recv(EVENT_SIZE * 2) for _ in range(2)]
-    assert [struct.unpack_from("=IH", event) for event in sent] == [(UHID_INPUT2, 10)] * 2
-    assert sent[0][6:16] == input_report(GamepadState(buttons=int(Button.ASSISTANT)))
-    assert sent[1][6:16] == input_report(GamepadState())
+    assert _reports(kernel, 2) == [
+        input_report(GamepadState(buttons=int(Button.ASSISTANT))),
+        input_report(GamepadState()),
+    ]
 
     pad.close()
     pad.close()  # once is enough
-    assert kernel.recv(EVENT_SIZE) == b""  # the file is closed: the kernel destroys the device
-    kernel.close()
+    kernel.settimeout(5)
+    while kernel.recv(EVENT_SIZE * 2):  # the state repeated meanwhile, then the end
+        pass
+
+
+@linux_only
+def test_the_state_is_written_again_while_nothing_changes_and_a_new_start_names_its_node(kernel, monkeypatch):
+    """The kernel drops the input written while a HID driver takes the device, a new driver's
+    event device knows no report, and a program that opens the hidraw node has seen none: the
+    pad repeats its state at a steady pace, so each has it a moment later. A change is written
+    at once all the same, and a pad that was given no state writes nothing."""
+    monkeypatch.setattr(uhid.UhidPad, "REFRESH", 0.02)
+    pad = _create_pad(kernel)
+
+    def written(wait: float = 0.0) -> list[bytes]:
+        """The reports the pad has written since the last look, after waiting up to that long for
+        the first of them."""
+        seen: list[bytes] = []
+        kernel.settimeout(wait)  # 0 is no waiting at all
+        while True:
+            try:
+                event = kernel.recv(EVENT_SIZE * 2)
+            except (TimeoutError, BlockingIOError):
+                return seen
+            assert struct.unpack_from("=IH", event) == (UHID_INPUT2, 10)
+            seen.append(event[6:16])
+            kernel.settimeout(0)
+
+    def repeats(report: bytes, count: int) -> None:
+        """Wait until the pad has written that report that many times more, and nothing else."""
+        seen: list[bytes] = []
+        deadline = time.monotonic() + 5
+        while len(seen) < count:
+            assert time.monotonic() < deadline, f"{len(seen)} of {count} repeats in time"
+            seen += written(0.5)
+        assert set(seen) == {report}
+
+    assert written(0.3) == []  # no state yet: nothing to repeat
+    held = input_report(GamepadState(buttons=int(Button.A), lx=32767))
+    pad.apply_state(GamepadState(buttons=int(Button.A), lx=32767))
+    repeats(held, 5)
+
+    pad.apply_state(GamepadState(buttons=int(Button.B)))
+    changed = input_report(GamepadState(buttons=int(Button.B)))
+    assert written()[-1] == changed  # written at once, not at the next turn
+    repeats(changed, 3)
+
+    assert pad.device == "/dev/hidraw9"
+    monkeypatch.setattr(uhid, "find_hidraw", lambda _phys, _root="": "/dev/hidraw12")
+    kernel.send(_plain(UHID_STOP))
+    kernel.send(_plain(UHID_START))  # another driver has the device, with a node of its own
+    wait_until(lambda: pad.device == "/dev/hidraw12")
+    written()
+    repeats(changed, 2)  # and is written the state
+    pad.close()
+
+
+@linux_only
+def test_a_pad_no_driver_takes_says_so(kernel, monkeypatch):
+    monkeypatch.setattr(uhid.UhidPad, "START_TIMEOUT", 0.1)
+    with pytest.raises(SetupError, match=r"did not start the virtual pad within 0.1 s: no HID driver took it"):
+        uhid.UhidPad("c0")
+    kernel.recv(EVENT_SIZE * 2)  # the create event
+    assert kernel.recv(EVENT_SIZE * 2) == b""  # and the file closed again
+
+
+@linux_only
+def test_a_pad_without_a_hidraw_node_names_none_and_one_the_kernel_dropped_says_so(kernel, monkeypatch):
+    monkeypatch.setattr(uhid, "find_hidraw", lambda _phys, _root="": None)  # a kernel built without hidraw
+    monkeypatch.setattr(uhid.UhidPad, "NODE_WAIT", 0.05)
+    pad = _create_pad(kernel)
+    assert pad.device is None
+    pad.apply_state(GamepadState(buttons=int(Button.A)))
+    assert _reports(kernel, 1) == [input_report(GamepadState(buttons=int(Button.A)))]
+    kernel.close()  # the device is gone under the pad
+
+    def press() -> None:
+        for _ in range(100):  # the first write may still land in the socket
+            pad.apply_state(GamepadState(buttons=int(Button.B)))
+            pad.apply_state(GamepadState())
+            time.sleep(0.01)
+
+    with pytest.raises(SetupError, match="the virtual pad no longer takes reports"):
+        press()
+    pad.close()
+
+
+@linux_only
+def test_a_rumble_left_running_stops_when_the_last_program_closes_the_pad(kernel):
+    pad = _create_pad(kernel)
+    levels: list[tuple[int, int]] = []
+    pad.on_rumble(lambda strong, weak: levels.append((strong, weak)))
+    kernel.send(_plain(UHID_OPEN))
+    kernel.send(_output(b"\x05\x00\xc0\x00\x20"))
+    wait_until(lambda: levels == [(0xC0, 0x20)])
+    kernel.send(_plain(UHID_CLOSE))  # the program is gone, its rumble still on
+    wait_until(lambda: levels == [(0xC0, 0x20), (0, 0)])
+    pad.close()
 
 
 # ---- in the receiver -------------------------------------------------------------------------

@@ -317,13 +317,15 @@ def set_report_request(event: bytes) -> tuple[int, int, int, bytes]:
 
 
 class Requests:
-    """What the pad does with each event the kernel sends: the motor levels it last asked for, and
-    the answer a request waits for. Kept apart from the device so it runs anywhere."""
+    """What the pad does with each event the kernel sends: the motor levels it last asked for, the
+    answer a request waits for, and how often the device was started. Kept apart from the device
+    so it runs anywhere."""
 
     def __init__(self) -> None:
         self.levels = (0, 0)  # strong, weak: 0..65535
-        self.started = False
-        self.opened = False
+        #: ``UHID_START``: a HID driver has taken the device and is making its nodes. More than
+        #: once when the kernel gives the device to another driver.
+        self.starts = 0
 
     def handle(self, event: bytes) -> bytes | None:
         """One event read from the uhid file; returns the reply to write, if it needs one."""
@@ -344,10 +346,13 @@ class Requests:
         if kind == UHID_GET_REPORT:  # the pad has no report to read back
             request, _rnum, _rtype = get_report_request(event)
             return get_report_reply_event(request, errno.EIO)
-        if kind in (UHID_START, UHID_STOP):
-            self.started = kind == UHID_START
-        elif kind in (UHID_OPEN, UHID_CLOSE):
-            self.opened = kind == UHID_OPEN
+        if kind == UHID_START:
+            self.starts += 1
+        elif kind in (UHID_CLOSE, UHID_STOP):
+            # The last program has closed the pad's nodes, or the driver has let go of the device:
+            # nobody is left to stop a rumble. A program that ends while its rumble runs gets here
+            # (one that plays an effect through the event device has it stopped by the kernel).
+            self.levels = (0, 0)
         return None
 
 
@@ -401,11 +406,22 @@ class UhidPad:
     takes_state = True
     #: How long the kernel may take to start the device after it is created.
     START_TIMEOUT = 5.0
+    #: The state is written again this often while nothing changes (seconds): see
+    #: :meth:`_keep_up`. The kernel passes a report that changes nothing on to the programs that
+    #: read the hidraw node, and makes no event of it on the event device.
+    REFRESH = 0.1
+    #: How long after a start the hidraw node is looked for (seconds).
+    NODE_WAIT = 1.0
     label: str
     device: str | None  # the hidraw node, e.g. /dev/hidraw7
+    _phys: str
     _poll: Any
     _requests: Requests
     _report: bytes
+    _report_lock: threading.Lock  # the report last written, and the writing of it
+    _written: float  # when it was last written, or would have been, on the monotonic clock
+    _starts: int
+    _node_until: float
     _sent: tuple[int, int]
     _callback: Callable[[int, int], None] | None
     _lock: threading.Lock  # the callback and what was last sent to it
@@ -422,8 +438,13 @@ class UhidPad:
 
         self.label = label
         self.device = None
+        self._phys = f"stadiacast/{os.getpid()}/{label}"  # what the pad's nodes are found by: no other's
         self._requests = Requests()
         self._report = b""
+        self._report_lock = threading.Lock()
+        self._written = time.monotonic()
+        self._starts = 0
+        self._node_until = 0.0
         self._sent = (0, 0)
         self._callback = None
         self._lock = threading.Lock()
@@ -433,9 +454,8 @@ class UhidPad:
         self._poll = select.poll()
         self._poll.register(self._fd, select.POLLIN)
         self._poll.register(self._wake_r, select.POLLIN)
-        phys = f"stadiacast/{label}"
         try:
-            os.write(self._fd, create2_event(PAD_NAME, phys, label))
+            os.write(self._fd, create2_event(PAD_NAME, self._phys, label))
             self._wait_started()
         except SetupError:
             self._close_files()
@@ -443,28 +463,32 @@ class UhidPad:
         except OSError as e:
             self._close_files()
             raise SetupError(f"the kernel refused the virtual pad: {e}") from e
-        self.device = self._find_node(phys)
+        self._starts = self._requests.starts
+        self.device = self._find_node()
         self._thread = threading.Thread(target=self._feedback_loop, name=f"uhid-{label}", daemon=True)
         self._thread.start()
 
     def _wait_started(self) -> None:
-        """Input written before the kernel has started the device is refused: wait for it."""
+        """Wait until a HID driver has taken the device: the kernel has no device to give input to
+        before, and no node to name."""
         deadline = time.monotonic() + self.START_TIMEOUT
-        while not self._requests.started:
+        while not self._requests.starts:
             left = deadline - time.monotonic()
             if left <= 0:
-                raise SetupError(f"the kernel did not start the virtual pad within {self.START_TIMEOUT:g} s")
+                raise SetupError(
+                    f"the kernel did not start the virtual pad within {self.START_TIMEOUT:g} s: no HID driver"
+                    " took it (`sudo modprobe hid-generic` loads the kernel's)"
+                )
             if self._poll.poll(int(left * 1000) + 1):
                 self._read_events()
 
-    @staticmethod
-    def _find_node(phys: str) -> str | None:
-        for _ in range(20):  # the hidraw node follows the start by a moment
-            node = find_hidraw(phys)
-            if node is not None:
+    def _find_node(self) -> str | None:
+        deadline = time.monotonic() + self.NODE_WAIT
+        while True:  # the hidraw node follows the start by a moment
+            node = find_hidraw(self._phys)
+            if node is not None or time.monotonic() >= deadline:
                 return node
-            time.sleep(0.05)
-        return None
+            time.sleep(0.01)
 
     def _close_files(self) -> None:
         for fd in (self._fd, self._wake_r, self._wake_w):
@@ -474,13 +498,22 @@ class UhidPad:
     # ---- input ---------------------------------------------------------------------------
     def apply_state(self, state: GamepadState) -> None:
         report = input_report(state)
-        if report == self._report:
-            return
-        try:
-            os.write(self._fd, input2_event(report))
-        except OSError as e:
-            raise SetupError(f"the virtual pad no longer takes reports: {e}") from e
-        self._report = report
+        with self._report_lock:
+            if report == self._report:
+                return
+            try:
+                os.write(self._fd, input2_event(report))
+            except OSError as e:
+                raise SetupError(f"the virtual pad no longer takes reports: {e}") from e
+            self._report = report
+            self._written = time.monotonic()
+
+    def _write_again(self) -> None:
+        with self._report_lock:
+            if self._report:  # a pad that was given no state has none to repeat
+                with contextlib.suppress(OSError):
+                    os.write(self._fd, input2_event(self._report))
+            self._written = time.monotonic()
 
     def apply(self, xinput: dict[str, int]) -> None:
         self.apply_state(state_from_xinput(xinput))
@@ -515,8 +548,9 @@ class UhidPad:
 
     def _feedback_loop(self) -> None:
         while True:
+            left = self._written + self.REFRESH - time.monotonic()  # until the state is due again
             try:
-                ready = self._poll.poll(None)
+                ready = self._poll.poll(max(0.0, left) * 1000)
             except OSError:
                 return
             for fd, _what in ready:
@@ -525,7 +559,35 @@ class UhidPad:
                         return
                 elif not self._read_events():
                     return
+            self._keep_up()
             self._tell()
+
+    def _keep_up(self) -> None:
+        """Write the state again when it has not changed for a while, and follow the device's node.
+
+        The kernel has no word for when a report was lost or never seen, so the state is repeated
+        (:attr:`REFRESH`), as many controllers repeat theirs on a wire:
+
+        - A HID driver that is taking the device drops the input written meanwhile, and the writer
+          is told nothing. Its event device then reads the sticks as held in a corner until a
+          report arrives. Every start is a driver taking the device: the first pad after a boot is
+          started twice, for the generic driver and then, once udev has loaded it, for the
+          kernel's Stadia driver.
+        - A program that opens the hidraw node sees only what is written from then on. SDL's Stadia
+          driver starts from a state of its own in which the D-pad is held up, and misses that
+          press until it has read a report.
+
+        A start also makes a new hidraw node, which is looked up again."""
+        now = time.monotonic()
+        if self._requests.starts != self._starts:
+            self._starts = self._requests.starts
+            self._node_until = now + self.NODE_WAIT
+        if now < self._node_until:
+            node = find_hidraw(self._phys)
+            if node is not None:
+                self.device = node
+        if now - self._written >= self.REFRESH:
+            self._write_again()
 
     def _tell(self) -> None:
         """Hand the motor levels to the callback when they are not the ones it got last."""
