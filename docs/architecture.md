@@ -134,6 +134,32 @@ together add up, and a periodic effect is rumble on both motors. Like a feed, th
 for one boot of its controller, and closing its file is what removes it: asking the kernel to
 destroy the device first can cross a game's request on the way.
 
+The Linux Stadia pad (`uhid_gamepad.py`, `--gamepad uhid`) is a HID device the receiver creates
+through `/dev/uhid`, with the kernel's events packed in the module. It has the wired
+controller's ids and name and sends its input report, so a program reads it the way it reads
+that controller. Steam and SDL 3 read the report itself from the pad's `hidraw` node, with
+their Stadia driver. SDL 2, whose HID code passes over a device without a USB parent, browsers
+and the rest read the event device the kernel makes of the report descriptor, with the mapping
+they keep for these ids. That mapping goes by the buttons' numbers, which count the key codes
+in rising order, so the descriptor, which is written in the module and is not the
+controller's, gives the event device the controller's key codes, axes and ranges exactly.
+The shared code hands this pad the whole `GamepadState` (`takes_state`), since XInput's fields
+have no room for Assistant and Capture.
+
+The kernel starts the device once for every HID driver that takes it: the first pad after a
+boot goes to the generic driver and then, once udev has loaded it, to the kernel's Stadia
+driver (`hid-google-stadiaff`), with a new event device that knows no report and reads its
+sticks as held in a corner. A driver that is taking the device also drops the input written
+meanwhile, and nothing says when it is done. A program that opens the `hidraw` node sees only
+what is written from then on, and SDL's Stadia driver starts from a state in which the D-pad
+is held up. So the pad's thread writes the state again every 100 ms while nothing changes:
+the kernel hands such a report to the `hidraw` readers and makes no event of it on the event
+device. Rumble arrives as output report 5 in two ways, a write to the `hidraw` node and a
+request of the kernel's driver for a game's force feedback, which waits for its answer: the
+pad's thread gives it. When the last program closes the pad's nodes the motors are stopped,
+since a program that ended while its rumble ran is not there to do it. Both Linux pads are
+closed in a worker thread: the kernel takes a tenth of a second or so to remove a device.
+
 **`RtcEndpoint`** is one UDP socket and one peer. It demultiplexes datagrams (STUN / DTLS /
 RTP), runs the connectivity checks and keepalives, drives the DTLS handshake through pyOpenSSL
 memory BIOs, exports SRTP keys, and delivers application data (`raw_dtls` sessions) or decrypted

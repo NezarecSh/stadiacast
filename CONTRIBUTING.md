@@ -30,10 +30,11 @@ make coverage     # the suite with a line and branch coverage report
 CI runs the same on Linux and macOS with Python 3.11 to 3.14, and the tests once more with
 every direct dependency at the lowest version `pyproject.toml` allows; the manual Windows lab
 workflow runs the suite, the Windows-only drivers and the Windows executables on a Windows
-runner, and the manual Linux lab workflow the Linux pad against a real kernel. On a Linux
-machine of your own, `STADIACAST_LINUX_LAB=1 uv run pytest tests/test_linux_lab.py` does the
-same, as a user who may open `/dev/uinput`: a pad appears on the system while it runs, and A,
-the left stick and the left trigger are what it presses.
+runner, and the manual Linux lab workflow the Linux pads against a real kernel. On a Linux
+machine of your own, `STADIACAST_LINUX_LAB=1 uv run pytest tests/test_linux_lab.py
+tests/test_linux_uhid_lab.py` does the same, as a user who may open `/dev/uinput` and, for the
+Stadia pad, `/dev/uhid` and the pad's `hidraw` node: a pad appears on the system while it runs,
+and A, the left stick and the left trigger are what it presses.
 
 ## Tests
 

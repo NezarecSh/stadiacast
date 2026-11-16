@@ -9,10 +9,11 @@ All notable changes to this project are documented here. The format follows
 ### Added
 - A virtual Stadia Controller on Linux: `--gamepad uhid` turns each controller into a wired
   Stadia Controller (USB `18d1:9400`) instead of an Xbox 360 pad, through the kernel's uhid
-  device. Steam and SDL drive it with their own Stadia support, which keeps the Assistant and
-  Capture buttons that an Xbox pad has no place for, and send its rumble back to the
-  controller. Opening `/dev/uhid` and the pad's `hidraw` node takes the udev rule in the
-  README.
+  device. Steam and programs built on SDL 3 drive it with their own Stadia support, which
+  keeps the Assistant and Capture buttons that an Xbox pad has no place for; SDL 2 games and
+  browsers read it with the mapping they have for that controller. A game's rumble comes back
+  to the controller. Opening `/dev/uhid` and the pad's `hidraw` node takes the udev rules in
+  the README.
 
 ### Fixed
 - On Linux, a controller that was switched off held up the other controllers and the headset
