@@ -62,17 +62,18 @@ UHID_DATA_MAX = 4096
 HID_MAX_DESCRIPTOR_SIZE = 4096
 BUS_USB = 0x03
 
-#: ``struct uhid_event`` is packed: a ``__u32`` type and a union whose widest member is
-#: ``struct uhid_create2_req`` (names, ids, then the descriptor). The kernel reads and writes whole
-#: events, so every event is written padded to this size.
-CREATE2 = struct.Struct(f"<I128s64s64sHHIIII{HID_MAX_DESCRIPTOR_SIZE}s")
+#: ``struct uhid_event`` is packed, in the machine's byte order (``=``): a ``__u32`` type and a
+#: union whose widest member is ``struct uhid_create2_req`` (names, ids, then the descriptor). The
+#: kernel hands out whole events. It takes a shorter one as if zeros followed, so an input report
+#: and a reply are written as their head and what they carry.
+CREATE2 = struct.Struct(f"=I128s64s64sHHIIII{HID_MAX_DESCRIPTOR_SIZE}s")
 EVENT_SIZE = CREATE2.size
-INPUT2 = struct.Struct(f"<IH{UHID_DATA_MAX}s")
-OUTPUT = struct.Struct(f"<I{UHID_DATA_MAX}sHB")  # uhid_output_req: the data comes first
-GET_REPORT = struct.Struct("<IIBB")
-GET_REPORT_REPLY = struct.Struct(f"<IIHH{UHID_DATA_MAX}s")
-SET_REPORT = struct.Struct(f"<IIBBH{UHID_DATA_MAX}s")
-SET_REPORT_REPLY = struct.Struct("<IIH")
+INPUT2 = struct.Struct("=IH")  # uhid_input2_req: the size, then that many bytes of report
+OUTPUT = struct.Struct(f"=I{UHID_DATA_MAX}sHB")  # uhid_output_req: the data comes first
+GET_REPORT = struct.Struct("=IIBB")
+GET_REPORT_REPLY = struct.Struct("=IIHH")  # the request, an error, the size, then the report
+SET_REPORT = struct.Struct(f"=IIBBH{UHID_DATA_MAX}s")
+SET_REPORT_REPLY = struct.Struct("=IIH")
 
 UHID_PATH = "/dev/uhid"
 
@@ -250,7 +251,7 @@ def state_from_xinput(xinput: Mapping[str, int]) -> GamepadState:
 def rumble_levels(data: bytes) -> tuple[int, int] | None:
     """The strong and the weak motor level (0..65535) of output report 5, or ``None`` for any
     other report. Both paths it arrives on, a ``hidraw`` write and the kernel's SET_REPORT, carry
-    the report id as the first byte."""
+    the report id as the first byte. A report's own numbers are little-endian on every machine."""
     if len(data) < 5 or data[0] != RUMBLE_REPORT_ID:
         return None
     strong, weak = struct.unpack_from("<HH", data, 1)
@@ -282,19 +283,19 @@ def create2_event(name: str, phys: str, uniq: str, descriptor: bytes = REPORT_DE
 
 
 def input2_event(report: bytes) -> bytes:
-    return _padded(INPUT2.pack(UHID_INPUT2, len(report), report))
+    return INPUT2.pack(UHID_INPUT2, len(report)) + report
 
 
 def set_report_reply_event(request: int, err: int) -> bytes:
-    return _padded(SET_REPORT_REPLY.pack(UHID_SET_REPORT_REPLY, request, err))
+    return SET_REPORT_REPLY.pack(UHID_SET_REPORT_REPLY, request, err)
 
 
 def get_report_reply_event(request: int, err: int) -> bytes:
-    return _padded(GET_REPORT_REPLY.pack(UHID_GET_REPORT_REPLY, request, err, 0, b""))
+    return GET_REPORT_REPLY.pack(UHID_GET_REPORT_REPLY, request, err, 0)
 
 
 def event_type(event: bytes) -> int | None:
-    return struct.unpack_from("<I", event)[0] if len(event) >= 4 else None
+    return struct.unpack_from("=I", event)[0] if len(event) >= 4 else None
 
 
 def output_request(event: bytes) -> tuple[bytes, int]:

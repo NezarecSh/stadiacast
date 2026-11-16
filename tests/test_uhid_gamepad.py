@@ -55,23 +55,22 @@ def test_events_have_the_size_and_offsets_of_linux_uhid_h():
     assert EVENT_SIZE == 4 + 128 + 64 + 64 + 2 + 2 + 4 * 4 + 4096 == 4376
     event = create2_event("name", "phys", "uniq", b"\x05\x01")
     assert len(event) == EVENT_SIZE
-    assert struct.unpack_from("<I", event, 0) == (UHID_CREATE2,)
+    assert struct.unpack_from("=I", event, 0) == (UHID_CREATE2,)
     assert event[4:8] == b"name" and event[132:136] == b"phys" and event[196:200] == b"uniq"
-    rd_size, bus, vendor, product, version, country = struct.unpack_from("<HHIIII", event, 260)
+    rd_size, bus, vendor, product, version, country = struct.unpack_from("=HHIIII", event, 260)
     assert (rd_size, bus, vendor, product, version, country) == (2, 0x03, 0x18D1, 0x9400, 0x0100, 0)
     assert event[280:282] == b"\x05\x01"
 
     report = bytes(range(1, 11))
     event = input2_event(report)
-    assert len(event) == EVENT_SIZE and struct.unpack_from("<IH", event) == (UHID_INPUT2, 10)
-    assert event[6:16] == report
+    assert event == struct.pack("=IH", UHID_INPUT2, 10) + report  # no longer than what it carries
 
     # uhid_output_req puts the data first and its size and type after the 4096 bytes
-    output = struct.pack("<I", UHID_OUTPUT) + b"\x05\x01\x02\x03\x04".ljust(4096, b"\0") + struct.pack("<HB", 5, 1)
+    output = struct.pack("=I", UHID_OUTPUT) + b"\x05\x01\x02\x03\x04".ljust(4096, b"\0") + struct.pack("=HB", 5, 1)
     assert uhid.output_request(output) == (b"\x05\x01\x02\x03\x04", UHID_OUTPUT_REPORT)
-    get = struct.pack("<IIBB", UHID_GET_REPORT, 0xDEAD, 3, UHID_FEATURE_REPORT)
+    get = struct.pack("=IIBB", UHID_GET_REPORT, 0xDEAD, 3, UHID_FEATURE_REPORT)
     assert uhid.get_report_request(get) == (0xDEAD, 3, UHID_FEATURE_REPORT)
-    set_ = struct.pack("<IIBBH", UHID_SET_REPORT, 9, 5, UHID_OUTPUT_REPORT, 3) + b"\x05\x06\x07"
+    set_ = struct.pack("=IIBBH", UHID_SET_REPORT, 9, 5, UHID_OUTPUT_REPORT, 3) + b"\x05\x06\x07"
     assert uhid.set_report_request(set_) == (9, 5, UHID_OUTPUT_REPORT, b"\x05\x06\x07")
 
 
@@ -295,15 +294,15 @@ def test_an_xinput_field_set_reads_back_with_the_guide_as_the_stadia_button():
 
 # ---- the kernel's requests -------------------------------------------------------------------
 def _output(data: bytes, rtype: int = UHID_OUTPUT_REPORT) -> bytes:
-    return struct.pack("<I", UHID_OUTPUT) + data.ljust(4096, b"\0") + struct.pack("<HB", len(data), rtype)
+    return struct.pack("=I", UHID_OUTPUT) + data.ljust(4096, b"\0") + struct.pack("=HB", len(data), rtype)
 
 
 def _set_report(request: int, data: bytes, rtype: int = UHID_OUTPUT_REPORT) -> bytes:
-    return struct.pack("<IIBBH", UHID_SET_REPORT, request, data[0] if data else 0, rtype, len(data)) + data
+    return struct.pack("=IIBBH", UHID_SET_REPORT, request, data[0] if data else 0, rtype, len(data)) + data
 
 
 def _reply(event: bytes) -> tuple[int, int, int]:
-    return struct.unpack_from("<IIH", event)
+    return struct.unpack_from("=IIH", event)
 
 
 def test_rumble_is_output_report_5_with_the_strong_motor_first():
@@ -326,7 +325,7 @@ def test_a_set_report_sets_the_motors_and_is_answered_with_its_id():
     """What hid-google-stadiaff does for a game's force feedback; the kernel waits for the answer."""
     requests = Requests()
     reply = requests.handle(_set_report(77, b"\x05\x00\xff\x00\x10"))
-    assert reply is not None and len(reply) == EVENT_SIZE
+    assert reply is not None and len(reply) == 10  # the type, the request and the error
     assert _reply(reply) == (UHID_SET_REPORT_REPLY, 77, 0) and requests.levels == (0xFF00, 0x1000)
     refused = requests.handle(_set_report(78, b"\x03\x01"))
     assert refused is not None and _reply(refused) == (UHID_SET_REPORT_REPLY, 78, errno.EIO)
@@ -335,14 +334,14 @@ def test_a_set_report_sets_the_motors_and_is_answered_with_its_id():
 
 def test_a_get_report_is_refused_and_the_device_state_is_followed():
     requests = Requests()
-    reply = requests.handle(struct.pack("<IIBB", UHID_GET_REPORT, 5, 3, UHID_FEATURE_REPORT))
-    assert reply is not None and struct.unpack_from("<IIHH", reply) == (UHID_GET_REPORT_REPLY, 5, errno.EIO, 0)
+    reply = requests.handle(struct.pack("=IIBB", UHID_GET_REPORT, 5, 3, UHID_FEATURE_REPORT))
+    assert reply is not None and struct.unpack_from("=IIHH", reply) == (UHID_GET_REPORT_REPLY, 5, errno.EIO, 0)
     assert not requests.started and not requests.opened
     for kind in (UHID_START, UHID_OPEN):
-        assert requests.handle(struct.pack("<I", kind)) is None
+        assert requests.handle(struct.pack("=I", kind)) is None
     assert requests.started and requests.opened
     for kind in (UHID_CLOSE, UHID_STOP):
-        requests.handle(struct.pack("<I", kind))
+        requests.handle(struct.pack("=I", kind))
     assert not requests.started and not requests.opened
     assert requests.handle(b"") is None  # nothing to read: nothing done
 
@@ -403,12 +402,12 @@ def test_the_pad_waits_for_its_start_answers_on_its_thread_and_reports(monkeypat
     creating = threading.Thread(target=lambda: made.append(uhid.UhidPad("c0")))
     creating.start()
     create = kernel.recv(EVENT_SIZE * 2)
-    assert len(create) == EVENT_SIZE and struct.unpack_from("<I", create) == (UHID_CREATE2,)
+    assert len(create) == EVENT_SIZE and struct.unpack_from("=I", create) == (UHID_CREATE2,)
     assert create[4:40] == b"Google LLC Stadia Controller rev. A\0" and create[132:145] == b"stadiacast/c0"
-    assert struct.unpack_from("<II", create, 264) == (0x18D1, 0x9400)
+    assert struct.unpack_from("=II", create, 264) == (0x18D1, 0x9400)
     creating.join(0.2)
     assert creating.is_alive()  # no input before the kernel has started the device
-    kernel.send(struct.pack("<I", UHID_START).ljust(EVENT_SIZE, b"\0"))
+    kernel.send(struct.pack("=I", UHID_START).ljust(EVENT_SIZE, b"\0"))
     creating.join(5)
     (pad,) = made
     assert pad.device == "/dev/hidraw9"
@@ -429,7 +428,7 @@ def test_the_pad_waits_for_its_start_answers_on_its_thread_and_reports(monkeypat
     pad.apply_state(GamepadState(buttons=int(Button.ASSISTANT)))  # nothing changed: nothing written
     pad.reset()
     sent = [kernel.recv(EVENT_SIZE * 2) for _ in range(2)]
-    assert [struct.unpack_from("<IH", event) for event in sent] == [(UHID_INPUT2, 10)] * 2
+    assert [struct.unpack_from("=IH", event) for event in sent] == [(UHID_INPUT2, 10)] * 2
     assert sent[0][6:16] == input_report(GamepadState(buttons=int(Button.ASSISTANT)))
     assert sent[1][6:16] == input_report(GamepadState())
 
