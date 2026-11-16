@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-16
+
+A virtual Stadia Controller on Linux, with the Assistant and Capture buttons that an Xbox pad
+has no place for, and a receiver on Linux that switching a controller off no longer holds up.
+
 ### Added
 - A virtual Stadia Controller on Linux: `--gamepad uhid` turns each controller into a wired
   Stadia Controller (USB `18d1:9400`) instead of an Xbox 360 pad, through the kernel's uhid
@@ -232,7 +237,8 @@ confirmed against real controllers running the last Wi-Fi firmware, `ota.282115`
   security policy, code of conduct.
 - MIT License, with a `NOTICE` for the three protobuf schemas reproduced from the firmware.
 
-[Unreleased]: https://github.com/jkfran/stadiacast/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/jkfran/stadiacast/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/jkfran/stadiacast/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/jkfran/stadiacast/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/jkfran/stadiacast/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/jkfran/stadiacast/compare/v1.0.1...v1.1.0
