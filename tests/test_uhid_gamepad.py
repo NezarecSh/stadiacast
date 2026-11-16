@@ -393,6 +393,7 @@ def test_the_pad_is_for_linux_and_says_what_keeps_the_device_shut(tmp_path, monk
             uhid.check_available()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the kernel names a device with colons, which no file has there")
 def test_the_hidraw_node_is_found_by_the_pads_physical_path(tmp_path):
     for name, phys, nodes in (
         ("0003:18D1:9400.0001", "usb-0000:00:14.0-1/input1", ["hidraw2"]),
