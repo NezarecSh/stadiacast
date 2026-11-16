@@ -1,4 +1,4 @@
-"""A virtual gamepad per controller (Windows ViGEmBus, macOS OpenJoystickDriver or Linux uinput).
+"""A virtual gamepad per controller (Windows ViGEmBus, macOS OpenJoystickDriver, Linux uinput or uhid).
 
 ``--gamepad vigem`` creates one ViGEm pad per controller through ``vgamepad`` (the ``gamepad``
 extra, over the ViGEmBus driver), feeds every decoded input report to it as XInput fields, and
@@ -17,10 +17,10 @@ through the kernel's uinput (:mod:`stadiacast.uinput_gamepad`). It is removed wh
 goes away, as a wireless pad is when it is switched off.
 
 ``--gamepad uhid`` is the Linux pad as a wired Stadia Controller instead of an Xbox 360 pad: a HID
-device the receiver creates through the kernel's uhid (:mod:`stadiacast.uhid_gamepad`), which
-Steam and SDL drive with their Stadia support, Assistant and Capture included. A backend like it,
-which needs more than XInput's fields, says so with ``takes_state`` and is given the whole
-:class:`~stadiacast.gamepad.GamepadState`.
+device the receiver creates through the kernel's uhid (:mod:`stadiacast.uhid_gamepad`), which a
+program reads as it reads that controller, Steam and SDL 3 with their Stadia support, Assistant
+and Capture included. A backend like it, which needs more than XInput's fields, says so with
+``takes_state`` and is given the whole :class:`~stadiacast.gamepad.GamepadState`.
 
 :class:`PadBackend` is the small surface the receiver drives, so the tests run the same code
 against a fake pad on every platform.

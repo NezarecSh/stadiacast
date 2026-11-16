@@ -1,23 +1,28 @@
 """Linux virtual Stadia Controllers through the kernel's uhid device.
 
 ``--gamepad uhid`` gives each controller a HID device with the wired Stadia Controller's identity
-(USB ``18d1:9400``) and its input report layout (report 3), instead of the Xbox 360 pad of
-``--gamepad uinput``. Steam and SDL drive a pad with those ids through their own Stadia support
-(SDL's ``hidapi`` Stadia driver), which reads the two buttons an Xbox pad has no place for,
-Assistant and Capture, as buttons of their own (SDL's ``misc2`` and ``misc1``), and sends that
-driver's rumble. The kernel creates a ``hidraw`` node for those programs, and an event device for
-the ones that read input devices directly.
+(USB ``18d1:9400`` and its name) and its input report (report 3), instead of the Xbox 360 pad of
+``--gamepad uinput``. A program then reads it the way it reads that controller:
 
-The report descriptor is written here from the report layout (the byte offsets SDL reads); it is
-not the controller's own. Its button usages are picked so that the event device follows the
-kernel's gamepad conventions (``Documentation/input/gamepad.rst``): positional face buttons,
-``BTN_MODE`` for the Stadia button, and Assistant and Capture on ``BTN_TRIGGER_HAPPY1`` and ``2``.
+- Steam and SDL 3 through the pad's ``hidraw`` node, with their Stadia driver. It has the two
+  buttons an Xbox pad has no place for, Assistant and Capture (SDL 3's ``misc2`` and ``misc1``),
+  and writes its rumble to the same node.
+- SDL 2, whose HID code passes over a device that has no USB parent, browsers and everything
+  else through the event device the kernel makes of the report descriptor, with the mapping they
+  keep for these ids.
+
+So the event device has to be the wired controller's too. The report descriptor is written here,
+not taken from the controller, to describe the report layout SDL's driver reads with the button
+usages and the ranges that give the event device the controller's key codes and axes: the eleven
+keys of an Xbox pad (``BTN_A`` to ``BTN_THUMBR``), Assistant and Capture on
+``BTN_TRIGGER_HAPPY1`` and ``2``, the triggers' digital bits on ``4`` and ``3``, sticks from 1 to
+255. Those are the button numbers SDL's mapping database and Chromium know the controller by.
 
 A game's rumble arrives on the uhid file in one of two ways, both as output report 5 (two 16-bit
-motor levels, strong first): Steam and SDL write it to the ``hidraw`` node (``UHID_OUTPUT``), and
-the kernel's ``hid-google-stadiaff`` driver, which binds to these ids and gives the event device
-force feedback, sends it as a SET_REPORT request (``UHID_SET_REPORT``), which waits for an answer.
-Every request is answered on a thread of the pad's own, so none waits for the event loop.
+motor levels, strong first): Steam and SDL 3 write it to the ``hidraw`` node (``UHID_OUTPUT``),
+and the kernel's ``hid-google-stadiaff`` driver, which binds to these ids and gives the event
+device force feedback, sends it as a SET_REPORT request (``UHID_SET_REPORT``), which waits for an
+answer. Every request is answered on a thread of the pad's own, so none waits for the event loop.
 
 The packing of the kernel's events and the report encoding are plain Python and run in the tests
 of every platform; :class:`UhidPad` needs Linux.
@@ -72,8 +77,9 @@ SET_REPORT_REPLY = struct.Struct("<IIH")
 UHID_PATH = "/dev/uhid"
 
 # ---- what the pad says it is -----------------------------------------------------------------
-#: The wired controller's ids and the name the kernel gives it over USB (manufacturer, product).
-PAD_NAME = "Google Inc. Stadia Controller"
+#: The wired controller's ids, and its name as the kernel has it over USB: the manufacturer and
+#: the product the controller itself states.
+PAD_NAME = "Google LLC Stadia Controller rev. A"
 PAD_VENDOR, PAD_PRODUCT, PAD_VERSION = 0x18D1, 0x9400, 0x0100
 INPUT_REPORT_ID = 3
 RUMBLE_REPORT_ID = 5
@@ -113,12 +119,15 @@ HAT: dict[tuple[int, int], int] = {
 HAT_RELEASED = 8
 
 # Button page usages for the report's bits, in report order. On a gamepad the kernel maps usage n
-# to BTN_GAMEPAD + n - 1 for n <= 16 and to BTN_TRIGGER_HAPPY + n - 17 above (hid-input.c).
+# to BTN_GAMEPAD + n - 1 for n <= 16 and to BTN_TRIGGER_HAPPY + n - 17 above (hid-input.c). These
+# give the event device the wired controller's key codes, and so its button numbers, which count
+# the codes in rising order: a key more or less, or two swapped, and every program with a mapping
+# for these ids reads the wrong buttons.
 _USAGES_BYTE2 = (
     18,  # Capture   -> BTN_TRIGGER_HAPPY2
     17,  # Assistant -> BTN_TRIGGER_HAPPY1
-    9,  # L2         -> BTN_TL2
-    10,  # R2        -> BTN_TR2
+    20,  # L2        -> BTN_TRIGGER_HAPPY4
+    19,  # R2        -> BTN_TRIGGER_HAPPY3
     13,  # Stadia    -> BTN_MODE
     12,  # Menu      -> BTN_START
     11,  # Options   -> BTN_SELECT
@@ -128,10 +137,10 @@ _USAGES_BYTE3 = (
     14,  # L3 -> BTN_THUMBL
     8,  # R1  -> BTN_TR
     7,  # L1  -> BTN_TL
-    4,  # Y   -> BTN_NORTH (BTN_X)
-    5,  # X   -> BTN_WEST (BTN_Y)
-    2,  # B   -> BTN_EAST
-    1,  # A   -> BTN_SOUTH
+    5,  # Y   -> BTN_Y, as on an Xbox pad (the code the kernel also calls BTN_WEST)
+    4,  # X   -> BTN_X (also BTN_NORTH)
+    2,  # B   -> BTN_B
+    1,  # A   -> BTN_A
 )
 
 #: Input report 3 (10 bytes: id, hat, two button bytes, four stick bytes, two trigger bytes) and
@@ -162,6 +171,7 @@ REPORT_DESCRIPTOR = bytes(
         0x09, 0x31,  # Usage (Y)
         0x09, 0x32,  # Usage (Z)
         0x09, 0x35,  # Usage (Rz)
+        0x15, 0x01,  # Logical Minimum (1): a stick rests at 128, the middle of 1..255
         0x26, 0xFF, 0x00,  # Logical Maximum (255)
         0x75, 0x08,  # Report Size (8)
         0x95, 0x04,  # Report Count (4)
@@ -169,6 +179,7 @@ REPORT_DESCRIPTOR = bytes(
         0x05, 0x02,  # Usage Page (Simulation Controls)
         0x09, 0xC5,  # Usage (Brake): L2
         0x09, 0xC4,  # Usage (Accelerator): R2
+        0x15, 0x00,  # Logical Minimum (0)
         0x95, 0x02,  # Report Count (2)
         0x81, 0x02,  # Input (Data, Variable, Absolute)
         0x85, RUMBLE_REPORT_ID,  # Report ID (5)

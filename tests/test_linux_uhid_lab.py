@@ -34,9 +34,15 @@ pytestmark = pytest.mark.skipif(
 )
 
 EV_KEY, EV_ABS, EV_FF = 0x01, 0x03, 0x15
-BTN_SOUTH, BTN_EAST, BTN_NORTH, BTN_WEST, BTN_MODE = 0x130, 0x131, 0x133, 0x134, 0x13C
-BTN_TRIGGER_HAPPY1, BTN_TRIGGER_HAPPY2 = 0x2C0, 0x2C1
+BTN_A, BTN_B, BTN_X, BTN_Y, BTN_TL, BTN_TR = 0x130, 0x131, 0x133, 0x134, 0x136, 0x137
+BTN_SELECT, BTN_START, BTN_MODE, BTN_THUMBL, BTN_THUMBR = 0x13A, 0x13B, 0x13C, 0x13D, 0x13E
+BTN_TRIGGER_HAPPY1, BTN_TRIGGER_HAPPY2, BTN_TRIGGER_HAPPY3, BTN_TRIGGER_HAPPY4 = 0x2C0, 0x2C1, 0x2C2, 0x2C3
 ABS_X, ABS_Y, ABS_Z, ABS_RZ, ABS_GAS, ABS_BRAKE, ABS_HAT0X, ABS_HAT0Y = 0, 1, 2, 5, 9, 10, 0x10, 0x11
+#: What the kernel makes of a wired Stadia Controller, less the three media keys of its headset
+#: socket: the keys in the order programs number them, and the axes.
+KEYS = [BTN_A, BTN_B, BTN_X, BTN_Y, BTN_TL, BTN_TR, BTN_SELECT, BTN_START, BTN_MODE, BTN_THUMBL, BTN_THUMBR]
+KEYS += [BTN_TRIGGER_HAPPY1, BTN_TRIGGER_HAPPY2, BTN_TRIGGER_HAPPY3, BTN_TRIGGER_HAPPY4]
+AXES = {ABS_X, ABS_Y, ABS_Z, ABS_RZ, ABS_GAS, ABS_BRAKE, ABS_HAT0X, ABS_HAT0Y}
 
 
 @pytest.fixture
@@ -78,9 +84,13 @@ def test_the_kernel_takes_the_pad_for_a_stadia_controller(pad: UhidPad) -> None:
     try:
         assert game.identity() == (0x03, 0x18D1, 0x9400, 0x0100)
         assert game.name() == PAD_NAME
-        keys = game.codes(EV_KEY)
-        assert {BTN_SOUTH, BTN_EAST, BTN_NORTH, BTN_WEST, BTN_MODE, BTN_TRIGGER_HAPPY1, BTN_TRIGGER_HAPPY2} <= keys
-        assert {ABS_X, ABS_Y, ABS_Z, ABS_RZ, ABS_GAS, ABS_BRAKE, ABS_HAT0X, ABS_HAT0Y} <= game.codes(EV_ABS)
+        assert sorted(game.codes(EV_KEY)) == KEYS  # one more or one less would renumber the buttons
+        assert game.codes(EV_ABS) == AXES
+        for stick in (ABS_X, ABS_Y, ABS_Z, ABS_RZ):
+            assert game.axis(stick)[1:3] == (1, 255)
+        for trigger in (ABS_GAS, ABS_BRAKE):
+            assert game.axis(trigger)[1:3] == (0, 255)
+        assert game.axis(ABS_HAT0X)[1:3] == game.axis(ABS_HAT0Y)[1:3] == (-1, 1)
         driver = _driver(pad.device)
         assert driver in ("stadia", "hid-generic")
         assert (EV_FF in game.codes(0)) == (driver == "stadia")  # force feedback comes with the kernel's driver
@@ -94,7 +104,7 @@ def test_input_reaches_the_hidraw_node_as_the_report_and_the_event_node_as_keys(
     game = Game(_event_node(pad.device))
     try:
         game.events()
-        state = GamepadState(buttons=int(Button.ASSISTANT | Button.CAPTURE | Button.A), lx=32767, l2=255)
+        state = GamepadState(buttons=int(Button.ASSISTANT | Button.CAPTURE | Button.A | Button.X), lx=32767, l2=255)
         pad.apply_state(state)
         reports: list[bytes] = []
 
@@ -109,7 +119,8 @@ def test_input_reaches_the_hidraw_node_as_the_report_and_the_event_node_as_keys(
         assert reports[0] == input_report(state)  # what SDL's Stadia driver reads
         events: list[tuple[int, int, int]] = []
         wait_until(lambda: bool(events.extend(game.events()) or (EV_KEY, BTN_TRIGGER_HAPPY1, 1) in events))
-        assert {(EV_KEY, BTN_TRIGGER_HAPPY1, 1), (EV_KEY, BTN_TRIGGER_HAPPY2, 1), (EV_KEY, BTN_SOUTH, 1)} <= set(events)
+        pressed = {code for kind, code, value in events if kind == EV_KEY and value == 1}
+        assert pressed == {BTN_TRIGGER_HAPPY1, BTN_TRIGGER_HAPPY2, BTN_A, BTN_X, BTN_TRIGGER_HAPPY4}  # 4: L2 held
         assert (EV_ABS, ABS_X, 255) in events and (EV_ABS, ABS_BRAKE, 255) in events
     finally:
         game.close()

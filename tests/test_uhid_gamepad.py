@@ -85,7 +85,7 @@ def _walk(descriptor: bytes) -> tuple[list[dict[str, Any]], int]:
     """The main items of a report descriptor with the globals and locals in force, and the depth
     of collections left open (0 when they all close)."""
     items: list[dict[str, Any]] = []
-    glob: dict[str, int] = {"report_id": 0, "size": 0, "count": 0, "page": 0}
+    glob: dict[str, int] = {"report_id": 0, "size": 0, "count": 0, "page": 0, "low": 0, "high": 0}
     usages: list[int] = []
     depth, i = 0, 0
     while i < len(descriptor):
@@ -95,7 +95,7 @@ def _walk(descriptor: bytes) -> tuple[list[dict[str, Any]], int]:
         value = int.from_bytes(descriptor[i + 1 : i + 1 + size], "little")
         i += 1 + size
         if kind == 1:  # global
-            key = {0: "page", 7: "size", 8: "report_id", 9: "count"}.get(tag)
+            key = {0: "page", 1: "low", 2: "high", 7: "size", 8: "report_id", 9: "count"}.get(tag)
             if key:
                 glob[key] = value
         elif kind == 2 and tag == 0:  # local: usage
@@ -124,17 +124,20 @@ def test_the_descriptor_describes_the_ten_byte_report_and_the_rumble_report():
     assert (rumble["report_id"], rumble["size"], rumble["count"]) == (5, 16, 2)
 
 
-def test_the_button_usages_follow_the_kernels_gamepad_conventions():
+def test_the_event_device_gets_the_wired_controllers_key_codes_and_button_numbers():
     """On a gamepad hid-input maps button usage n to BTN_GAMEPAD + n - 1 up to 16 and to
-    BTN_TRIGGER_HAPPY + n - 17 above: the face buttons land on their compass names, Assistant and
-    Capture on the first two BTN_TRIGGER_HAPPY codes."""
+    BTN_TRIGGER_HAPPY + n - 17 above. The codes have to be the wired controller's, because a
+    program that reads the event device numbers the buttons by rising code, and the mappings kept
+    for these ids go by those numbers: SDL's
+    (``a:b0,b:b1,x:b2,y:b3,leftshoulder:b4,rightshoulder:b5,back:b6,start:b7,guide:b8,``
+    ``leftstick:b9,rightstick:b10``) and Chromium's, which adds Assistant and Capture as 11 and 12."""
     (buttons,) = [item for item in _walk(REPORT_DESCRIPTOR)[0] if item["page"] == 0x09 and not item["flags"] & 1]
     btn_gamepad, btn_trigger_happy = 0x130, 0x2C0
 
     def code(usage: int) -> int:
         return btn_gamepad + usage - 1 if usage <= 16 else btn_trigger_happy + usage - 17
 
-    report_order = [
+    report_order: list[Any] = [
         Button.CAPTURE,
         Button.ASSISTANT,
         "l2",
@@ -151,25 +154,51 @@ def test_the_button_usages_follow_the_kernels_gamepad_conventions():
         Button.B,
         Button.A,
     ]
-    expected = {
-        Button.CAPTURE: 0x2C1,  # BTN_TRIGGER_HAPPY2
-        Button.ASSISTANT: 0x2C0,  # BTN_TRIGGER_HAPPY1
-        "l2": 0x138,  # BTN_TL2
-        "r2": 0x139,  # BTN_TR2
-        Button.STADIA: 0x13C,  # BTN_MODE
-        Button.MENU: 0x13B,  # BTN_START
-        Button.OPTIONS: 0x13A,  # BTN_SELECT
-        Button.R3: 0x13E,  # BTN_THUMBR
-        Button.L3: 0x13D,  # BTN_THUMBL
-        Button.R1: 0x137,  # BTN_TR
-        Button.L1: 0x136,  # BTN_TL
-        Button.Y: 0x133,  # BTN_NORTH
-        Button.X: 0x134,  # BTN_WEST
-        Button.B: 0x131,  # BTN_EAST
-        Button.A: 0x130,  # BTN_SOUTH
-    }
     assert buttons["count"] == len(buttons["usages"]) == 15
-    assert {name: code(usage) for name, usage in zip(report_order, buttons["usages"], strict=True)} == expected
+    codes = {name: code(usage) for name, usage in zip(report_order, buttons["usages"], strict=True)}
+    assert codes == {
+        Button.A: 0x130,  # BTN_A
+        Button.B: 0x131,  # BTN_B
+        Button.X: 0x133,  # BTN_X
+        Button.Y: 0x134,  # BTN_Y
+        Button.L1: 0x136,  # BTN_TL
+        Button.R1: 0x137,  # BTN_TR
+        Button.OPTIONS: 0x13A,  # BTN_SELECT
+        Button.MENU: 0x13B,  # BTN_START
+        Button.STADIA: 0x13C,  # BTN_MODE
+        Button.L3: 0x13D,  # BTN_THUMBL
+        Button.R3: 0x13E,  # BTN_THUMBR
+        Button.ASSISTANT: 0x2C0,  # BTN_TRIGGER_HAPPY1
+        Button.CAPTURE: 0x2C1,  # BTN_TRIGGER_HAPPY2
+        "r2": 0x2C2,  # BTN_TRIGGER_HAPPY3
+        "l2": 0x2C3,  # BTN_TRIGGER_HAPPY4
+    }
+    numbered = sorted(codes, key=lambda name: codes[name])
+    assert numbered[:11] == [
+        Button.A,
+        Button.B,
+        Button.X,
+        Button.Y,
+        Button.L1,
+        Button.R1,
+        Button.OPTIONS,  # back
+        Button.MENU,  # start
+        Button.STADIA,  # guide
+        Button.L3,
+        Button.R3,
+    ]
+    assert numbered[11:13] == [Button.ASSISTANT, Button.CAPTURE]
+
+
+def test_the_sticks_and_the_triggers_declare_the_range_the_report_uses():
+    """A stick's byte runs from 1 to 255 around 128: declared from 0, the event device would put
+    its rest off centre and never reach the far left or the top."""
+    items = _walk(REPORT_DESCRIPTOR)[0]
+    (sticks,) = [item for item in items if 0x30 in item["usages"]]
+    (triggers,) = [item for item in items if item["page"] == 0x02]
+    assert (sticks["usages"], sticks["low"], sticks["high"]) == ([0x30, 0x31, 0x32, 0x35], 1, 255)  # X, Y, Z, Rz
+    assert (triggers["usages"], triggers["low"], triggers["high"]) == ([0xC5, 0xC4], 0, 255)  # brake, accelerator
+    assert [stick_byte(value) for value in (-32768, 0, 32767)] == [1, 128, 255]
 
 
 # ---- the report as SDL reads it --------------------------------------------------------------
@@ -375,7 +404,7 @@ def test_the_pad_waits_for_its_start_answers_on_its_thread_and_reports(monkeypat
     creating.start()
     create = kernel.recv(EVENT_SIZE * 2)
     assert len(create) == EVENT_SIZE and struct.unpack_from("<I", create) == (UHID_CREATE2,)
-    assert create[4:33] == b"Google Inc. Stadia Controller" and create[132:145] == b"stadiacast/c0"
+    assert create[4:40] == b"Google LLC Stadia Controller rev. A\0" and create[132:145] == b"stadiacast/c0"
     assert struct.unpack_from("<II", create, 264) == (0x18D1, 0x9400)
     creating.join(0.2)
     assert creating.is_alive()  # no input before the kernel has started the device
