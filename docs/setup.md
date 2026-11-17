@@ -73,7 +73,7 @@ Ports used by the receiver:
 | 53 TCP/UDP | DNS | the DNS sink (`--dns-upstream` spawns it) |
 | 123 UDP | SNTP | time for the controller (`--sntp`, on in the `live` preset) |
 | 443 TCP | HTTPS | the Google endpoints the DNS sink redirects |
-| 80, 8008 TCP | HTTP | the local control endpoints `/_status`, `/_input`, `/_events`, `/_rumble`, `/_start_game`, `/_audio`, `/_shutdown` |
+| 80, 8008 TCP | HTTP | the local control endpoints `/_status`, `/_input`, `/_events`, `/_rumble`, `/_start_game`, `/_audio`, `/_mic`, `/_shutdown` |
 | 40000 UDP | STUN/DTLS | the display link of the first controller (`c0`) |
 | 40001 UDP | STUN/DTLS | the game-streaming session of the first controller |
 | 40002, 40003 UDP, ... | STUN/DTLS | the same pair for the second controller (`c1`), and so on: base port + 2 per controller |
@@ -184,6 +184,11 @@ names an action, `{"do": "start", "source": "system"}` (optionally with `volume`
 `application`), `{"do": "stop"}`, `{"do": "volume", "volume": 0.5}` or
 `{"do": "mode", "mode": 2}`. With several controllers, `controller` names the target, as
 for `/_rumble`.
+
+`/_mic` does the same for the controller's microphone: `GET` reports it and a `POST` names an
+action, `{"do": "on"}` / `{"do": "off"}` (the capture switch), `{"do": "pcm", "on": true}` (live
+PCM decoding) or `{"do": "ptt", "on": true}` (the Assistant button as push to talk). The
+capture files land in the run directory; see [the README](../README.md#controller-microphone).
 
 ### Waking the controller
 

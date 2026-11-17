@@ -23,6 +23,7 @@ from stadiacast.game_session import GameSession
 from stadiacast.gamepad import GamepadState
 from stadiacast.http_server import HttpResponse
 from stadiacast.input_protocol import InputDecoder
+from stadiacast.microphone import MIC_PAYLOAD_TYPE, MicrophoneCapture, capture_path
 from stadiacast.protos import PKG_RPC, decode_unknown
 from stadiacast.rtc import (
     WIRE_ID_RTP,
@@ -127,6 +128,9 @@ class ControllerSession:
             "input_series": 0,
             "last_ack": None,
             "input_payload_type": None,
+            "mic_packets": 0,
+            "mic_bytes": 0,
+            "mic_file": None,
             "registered": None,
             "discovery": None,
             "gmsg": {"pending_id": None, "sent": 0, "acked": 0, "polls": 0, "last_ack": None},
@@ -153,6 +157,13 @@ class ControllerSession:
         self._audio_volume = _clamp_volume(self.cfg.audio_volume)
         self._audio_application = self.cfg.audio_application
         self._audio_task: asyncio.Task[None] | None = None  # this boot's --audio-source autostart
+        #: One recording of the pad's microphone, created on its first Opus packet.
+        self._mic: MicrophoneCapture | None = None
+        self._mic_last: dict[str, Any] | None = None  # the finished capture, so /_mic still finds it
+        self.mic_on = False  # DisplayToController #5 was last sent true
+        self.mic_ptt = bool(self.cfg.mic_ptt)  # Assistant button = push to talk
+        self.mic_pcm = bool(self.cfg.mic_pcm)  # live PCM alongside the Ogg capture
+        self._mic_autostarted = False  # --mic-capture fires once per boot
 
     def __repr__(self) -> str:
         return f"ControllerSession({self.label}, key={self.key!r}, ip={self.ip!r})"
@@ -191,6 +202,7 @@ class ControllerSession:
                 task.cancel()
         self._rtcp_task = self._display_task = self._display_fallback_task = None
         self._stop_audio()
+        self._close_mic()
         if self.rx.gamepads is not None:
             self.rx.gamepads.release(self.label)
         self.game.close()
@@ -230,6 +242,9 @@ class ControllerSession:
         self.latest_input = None  # nothing it held is held any more
         self.session["display"] = _fresh_display_session()
         self._stop_audio()
+        self._close_mic()
+        self._mic_autostarted = False
+        self.mic_on = False
         if self.rx.gamepads is not None:
             self.rx.gamepads.release(self.label)
         self.game.reset()
@@ -251,6 +266,7 @@ class ControllerSession:
             "battery_percent": self.session["display"]["battery_percent"],
             "headset": self.session["display"]["headset"],
             "playback": self.audio_state(),
+            "microphone": self.mic_state(),
             **self.game.status(),
         }
 
@@ -407,6 +423,98 @@ class ControllerSession:
         sender, self._audio = self._audio, None
         if sender is not None:
             sender.kill_now()
+
+    # ---- controller microphone ---------------------------------------------------
+    def mic_start(self, *, reason: str = "api") -> dict[str, Any]:
+        """Ask the pad to send its microphone: ``DisplayToController`` #5 (BoolValue) = true.
+
+        Confirmed on hardware: Opus starts on the display session's audio m-line within a frame
+        or two, at one packet per 20 ms.  Nothing in the SDP or in the empty OK reply says so,
+        which is why a receiver that never sends this request looks like it has a broken decoder.
+        No party chat, no SCTP, no second session is involved.
+        """
+        p = self.protos
+        msg = p.DisplayToController()
+        msg.request5.value = True
+        ticket = self.send_rpc("request", msg, purpose="mic_capture")
+        self.mic_on = True
+        self.log("mic_capture", on=True, reason=reason, ticket=ticket)
+        return {"ok": ticket is not None, "on": True, "ticket": ticket}
+
+    def mic_stop(self, *, reason: str = "api") -> dict[str, Any]:
+        """#5 = false stops the stream; the open capture is finalised with an Ogg EOS page."""
+        p = self.protos
+        msg = p.DisplayToController()
+        msg.request5.value = False
+        ticket = self.send_rpc("request", msg, purpose="mic_capture")
+        self.mic_on = False
+        self._close_mic()
+        self.log("mic_capture", on=False, reason=reason, ticket=ticket)
+        return {"ok": ticket is not None, "on": False, "ticket": ticket}
+
+    def set_mic_pcm(self, on: bool) -> dict[str, Any]:
+        """Turn live PCM decoding on or off; a running capture is closed so both files line up."""
+        self._close_mic()
+        self.mic_pcm = bool(on)
+        self.log("mic_pcm_toggle", on=self.mic_pcm)
+        return {"ok": True, "pcm": self.mic_pcm}
+
+    def set_mic_ptt(self, on: bool) -> dict[str, Any]:
+        """Arm (or disarm) push-to-talk on the Assistant button."""
+        self.mic_ptt = bool(on)
+        self.log("mic_ptt_toggle", on=self.mic_ptt)
+        return {"ok": True, "ptt": self.mic_ptt}
+
+    def mic_state(self) -> dict[str, Any]:
+        """What ``/_mic`` and ``/_status`` report about the microphone."""
+        idle: dict[str, Any] = {"packets": 0, "bytes": 0, "file": None, "pcm_file": None, "pcm": None}
+        state = self._mic.state() if self._mic is not None else (self._mic_last or idle)
+        return {"on": self.mic_on, "ptt": self.mic_ptt, "pcm": self.mic_pcm, "controller": self.label, **state}
+
+    def _on_mic_packet(self, pkt: RtpPacket) -> None:
+        """One Opus packet from the pad's microphone (PT 111 on the display m-line)."""
+        if self._mic is None:
+            if not self.mic_on:
+                # A frame already queued when #5 went false: opening a file for it would leave
+                # an empty capture behind, and a second handle on the same directory entry.
+                return
+            path = capture_path(self.cfg.log_dir, self.label)
+            try:
+                self._mic = MicrophoneCapture(path, pcm=self.mic_pcm, log=self.log)
+            except OSError as e:
+                self.log("mic_open_failed", error=str(e), path=path)
+                return
+        self._mic.write(pkt.payload, pkt.timestamp)
+        self.session["mic_packets"] = self._mic.packets
+        self.session["mic_bytes"] = self._mic.bytes
+        self.session["mic_file"] = self._mic.path
+        if self._mic.packets <= 3 or self._mic.packets % 500 == 0:
+            self.log("mic_rtp", n=self._mic.packets, seq=pkt.seq, ts=pkt.timestamp, bytes=len(pkt.payload))
+
+    def _close_mic(self) -> None:
+        capture, self._mic = self._mic, None
+        if capture is not None:
+            self._mic_last = capture.state()  # keep the file name after the EOS page is written
+            capture.close()
+
+    def _maybe_start_mic(self) -> None:
+        """``--mic-capture``: ask for the microphone once per boot, when the link reaches READY."""
+        if not self.cfg.mic_capture or self._mic_autostarted or self.mic_on:
+            return
+        self._mic_autostarted = True
+        self.mic_start(reason="autostart")
+
+    def _maybe_push_to_talk(self, ev: dict[str, Any]) -> None:
+        """Assistant held = capture, released = stop.  The pad only reports that button on the
+        display link, so an input report is the one place a physical key can drive #5."""
+        if not self.mic_ptt:
+            return
+        pressed = ev.get("pressed_names") or []
+        released = ev.get("released_names") or []
+        if "assistant" in pressed and not self.mic_on:
+            self.mic_start(reason="ptt")
+        elif "assistant" in released and self.mic_on:
+            self.mic_stop(reason="ptt")
 
     # ---- discovery RPCs ------------------------------------------------------------------
     def register(self, request: Any, extra: dict[str, Any]) -> tuple[Any, str]:
@@ -706,6 +814,12 @@ class ControllerSession:
         sub-channel 0x66; the ack goes back the same way."""
         self.seen()
         self.session["input_payload_type"] = pkt.payload_type
+        # The pad's microphone shares the audio m-line with the headset downlink (Opus, PT 111,
+        # one packet per 20 ms).  It is not the input protocol: feeding it to InputDecoder is
+        # why every frame used to be logged as undecodable and thrown away.
+        if pkt.payload_type == MIC_PAYLOAD_TYPE:
+            self._on_mic_packet(pkt)
+            return
         try:
             decoded = self.input.decode(pkt.payload)
         except (DecodeError, ValueError) as e:
@@ -807,6 +921,7 @@ class ControllerSession:
             if DISPLAY_STATES.index(state) >= DISPLAY_STATES.index("ready"):
                 self.game.maybe_start()
                 self._maybe_start_audio()
+                self._maybe_start_mic()
 
     def mark_input(self, via: str) -> None:
         """Input has arrived over ``via`` (the game session reports through here)."""
@@ -1103,3 +1218,4 @@ class ControllerSession:
             self.latest_input = (GamepadState.from_event(ev), time.monotonic())
             self.rx.live_changed()
         self.rx.publish_event(ev)
+        self._maybe_push_to_talk(ev)

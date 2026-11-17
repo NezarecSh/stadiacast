@@ -53,6 +53,7 @@ from stadiacast.rtc import (
     DtlsCertificate,
     RtcEndpoint,
     RtpPacket,
+    build_rtp,
     parse_rtp,
     parse_wire_message,
     random_ice_string,
@@ -146,6 +147,12 @@ class FakeController:
         self.audio_unplayed = 0
         self.audio_payload_type = 111
         self.audio_route_open = False  # SetAudioModeRequest mode 2 was accepted in this boot
+        # The pad's own microphone: DisplayToController #5 (BoolValue) turns its Opus uplink on
+        # and off.  mic_frames are sent on the display link's audio m-line (RTP PT 111).
+        self.mic_requests: list[bool] = []
+        self.mic_capture = False
+        self._mic_seq = 0
+        self._mic_ts = 0x1000
         self.headset_plugged = False  # GetControllerStateResponse.f4
         self.serial_number = "FAKESERIAL0001"  # GetControllerStateResponse.f17
         self.start_game_requests: list[dict] = []  # DisplayToController #8 StartGame {ticket, key, number}
@@ -277,6 +284,8 @@ class FakeController:
                 self._on_start_game(rpc["ticket"], msg.start_game)
             elif msg.HasField("set_audio_mode") and msg.set_audio_mode.mode == AUDIO_MODE_WEBRTC_OPUS:
                 self._on_set_audio_mode(rpc["ticket"])
+            elif msg.HasField("request5"):
+                self._on_mic_capture(rpc["ticket"], msg.request5.value)
             else:
                 self.endpoint.send_wire(
                     WIRE_ID_DC_RPC_CONTROLLER,
@@ -306,6 +315,21 @@ class FakeController:
             self.audio_route_open = True
             response = p.rpc_response(ticket)
         self.endpoint.send_wire(WIRE_ID_DC_RPC_CONTROLLER, response)
+
+    def _on_mic_capture(self, ticket: int, on: bool) -> None:
+        """DisplayToController #5: the firmware opens or stops its microphone encoder."""
+        self.mic_requests.append(on)
+        self.mic_capture = on
+        self.endpoint.send_wire(WIRE_ID_DC_RPC_CONTROLLER, self.protos.rpc_response(ticket))
+
+    def send_mic_frame(self, payload: bytes | None = None, timestamp: int | None = None) -> bool:
+        """One 20 ms Opus packet from the pad's microphone, on the display link (raw_dtls)."""
+        self._mic_seq = (self._mic_seq + 1) & 0xFFFF
+        ts = self._mic_ts if timestamp is None else timestamp
+        self._mic_ts = (ts + 960) & 0xFFFFFFFF
+        frame = payload if payload is not None else b"\xf8" + b"\x41" * 159
+        packet = build_rtp(111, self._mic_seq, ts, 0x049A6E9C, frame)
+        return self.endpoint.send_wire(WIRE_ID_RTP, packet)
 
     def _on_start_game(self, ticket: int, req) -> None:
         """StartGame in READY: the app moves from BROWSE to STARTING_GAME and holds the reply

@@ -277,6 +277,24 @@ def build_parser(preset: str | None = None) -> argparse.ArgumentParser:
         help="SetAudioModeRequest sent before the stream: 2 = WebRTC Opus (the jack), 0 = do not send one",
     )
 
+    g = ap.add_argument_group("controller microphone")
+    g.add_argument(
+        "--mic-capture",
+        action="store_true",
+        help="ask the pad for its microphone once the link is READY; its Opus stream is written to "
+        "an Ogg file in the run directory (POST /_mic also starts and stops it)",
+    )
+    g.add_argument(
+        "--mic-pcm",
+        action="store_true",
+        help="also decode the microphone to live s16le 48 kHz mono PCM with ffmpeg (a .pcm beside the .ogg)",
+    )
+    g.add_argument(
+        "--mic-ptt",
+        action="store_true",
+        help="hold the Assistant button to capture, release to stop (push to talk)",
+    )
+
     g = ap.add_argument_group("virtual gamepad")
     g.add_argument(
         "--gamepad",
@@ -473,6 +491,9 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         audio_application=a.audio_application,
         audio_volume=a.audio_volume,
         audio_follow_volume=a.audio_follow_volume == "on",
+        mic_capture=a.mic_capture,
+        mic_pcm=a.mic_pcm,
+        mic_ptt=a.mic_ptt,
         gamepad=a.gamepad,
         gamepad_deadzone=a.gamepad_deadzone == "on",
         gamepad_profile=a.gamepad_profile,

@@ -46,6 +46,7 @@ Receiver                                   one per process (receiver.py)
       ├── InputDecoder                     InputProtocolMessage stream (input_protocol.py)
       ├── AudioSender                      Opus to the headset jack, paced RTP on the media pair (audio.py)
       │    └── BlockCapture                PCM for system / device:NAME (capture.py; loopback.py on Windows)
+      ├── MicrophoneCapture               Opus from the pad's mic into Ogg + optional live PCM (microphone.py)
       └── GameSession                      StartGame, proxied RPCs, rumble (game_session.py)
            ├── RtcEndpoint "game"          second UDP socket, own certificate
            └── InputDecoder
@@ -80,6 +81,13 @@ session keeps the stream's gain and libopus application across starts, since a s
 lives while it plays. ffmpeg is only the convenient encoder: a front end with its own capture
 and encoder starts the pacer alone with `audio_start(None)` and hands it Opus frames through
 `audio_feed()`.
+
+The same session owns the *other* direction of that m-line when `--mic-capture`, `/_mic` or
+`--mic-ptt` asks for it: `DisplayToController` #5 switches the pad's encoder on, RTP PT 111 is
+routed away from `InputDecoder` into a `MicrophoneCapture` (`microphone.py`), which streams the
+Opus packets into an unbuffered Ogg file and, optionally, through one long-lived ffmpeg into
+live s16le PCM. The decoder is fed from a bounded queue on a writer thread, so a slow consumer
+drops Ogg pages rather than stalling the RTP callback.
 
 **`AudioSender`** runs ffmpeg as its encoder and starts it again when it exits. For `system` and
 `device:NAME` it also runs a `BlockCapture` (`capture.py`): a `CaptureDevice` says which PCM

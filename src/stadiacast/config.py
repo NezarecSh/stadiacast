@@ -80,6 +80,11 @@ class Config:
     audio_volume: float = 1.0  # linear gain before encoding (above 1 a limiter guards against clipping)
     audio_follow_volume: bool = True  # Windows: scale the loopback capture by the volume slider (False: before it)
 
+    # -- controller microphone --------------------------------------------------------------
+    mic_capture: bool = False  # DisplayToController #5 = true at READY; the pad then sends Opus on PT 111
+    mic_pcm: bool = False  # also decode the capture to live s16le PCM with ffmpeg (needs ffmpeg on PATH)
+    mic_ptt: bool = False  # hold the Assistant button to capture, release to stop
+
     # -- virtual gamepad (the input as a pad on this PC) -----------------------------------
     # off | vigem (Windows) | ojd (macOS) | uinput (Linux, Xbox 360 pad) | uhid (Linux, Stadia Controller);
     # implies StartGame for rumble

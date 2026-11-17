@@ -36,6 +36,8 @@ vibrates on request and plays sound on its headset jack.
   controller for Mac games, rumble included.
 - 🎧 **Headset audio.** What the PC plays, or any file, streams to a headset plugged into the
   controller.
+- 🎤 **The controller's microphone.** One RPC switches on the pad's own mic; its Opus stream
+  is recorded to a playable Ogg file, with optional live PCM for forwarding.
 - 👥 **Several controllers at once**, each one its own player.
 
 <p align="center">
@@ -119,7 +121,9 @@ stadiacast --preset live --dns-upstream 192.168.1.1   # your router: the DNS sin
 - Nothing else for the basics: the receiver ships a certificate the controller accepts
   ([serving your own](docs/setup.md#certificate) is optional), and the executables include
   Python. An install from PyPI or from source needs Python 3.11 or newer.
-- Optional: ffmpeg for [headset audio](#headset-audio), a driver for the virtual gamepad on
+- Optional: ffmpeg for [headset audio](#headset-audio) and for live PCM from the
+  [controller's microphone](#controller-microphone) (the Ogg recording itself needs nothing),
+  a driver for the virtual gamepad on
   [Windows](#virtual-gamepad-windows) and on [macOS](#virtual-gamepad-macos) (the one on
   [Linux](#virtual-gamepad-linux) needs none), `tcpdump` for packet captures.
 
@@ -189,6 +193,28 @@ loudness with `--audio-volume`, since the volume keys do not act on the monitor.
 on Linux is a PortAudio input and needs the `audio` extra and the PortAudio library (`apt
 install libportaudio2`). How the stream rides the display link is in
 [docs/protocol.md](docs/protocol.md#audio-to-the-headset-jack).
+
+## Controller microphone
+
+The controller has a microphone of its own (the one the Assistant button used). It is not part
+of party chat: one `DisplayToController` #5 request switches it on, and the pad then sends Opus
+on the display link's audio m-line. The receiver writes those packets to an Ogg file in the run
+directory, playable while it is still being recorded:
+
+```sh
+stadiacast --mic-capture                    # ask for the mic at READY, record to mic_<c0>_<time>.ogg
+stadiacast --mic-capture --mic-pcm          # also write live s16le 48 kHz mono PCM to a .pcm file
+stadiacast --mic-capture --mic-ptt          # hold the Assistant button to record, release to stop
+```
+
+`POST /_mic` with `{"do":"on"}` / `{"do":"off"}` starts and stops it, `{"do":"pcm","on":true}`
+and `{"do":"ptt","on":true}` toggle the other two, and `GET /_mic` (also `/_status` under
+`microphone`) reports the file, the packet count and the PCM level. `--mic-pcm` needs ffmpeg on
+`PATH`; without it the Ogg capture still works. Everything is off by default.
+
+The stream is about 64 kbit/s with no DTX: a quiet room is full-rate encoded silence, not a
+broken decoder. [docs/protocol.md](docs/protocol.md#the-controllers-microphone) has the wire
+details, including why the answer has to name an audio codec even when the offer does not.
 
 ## Virtual gamepad (Windows)
 

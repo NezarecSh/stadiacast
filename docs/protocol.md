@@ -215,6 +215,57 @@ Three more details, each found by getting it wrong on a real controller:
 - **Pacing in the sender.** Frames are sent one per 20 ms slot, polling every 4 ms. Windows'
   default timer granularity is 15.6 ms, so a plain `sleep(0.02)` degenerates into 20/31 ms.
 
+### The controller's microphone
+
+The pad's own microphone is the *other* direction of the same audio m-line. It needs no party
+chat, no SCTP data channel and no second WebRTC session -- all of which can be built and will
+still show `rtp_in: 0` on their own. What it does need is one request:
+
+1. **`DisplayToController` #5 (`BoolValue`) = `true`.** This is the microphone capture switch.
+   Opus starts on the display link within a frame or two, at one packet every 20 ms; `false`
+   stops it. The response is an empty OK, so a receiver that never sends #5 sees a perfectly
+   healthy link and no audio at all. A/B on hardware (6 s windows): `false` +22 packets,
+   `true` +295, `false` +21, `true` +295 -- 49/s, exactly one 20 ms frame.
+2. **A codec in the answer.** The pad can offer an `audio_ssrc` with `audio_format=[]`:
+   the answerer chooses. An answer with no `audio_format` tells it there is no usable codec,
+   and it has nothing to encode into. `build_answer()` now replies with
+   `AUDIO_CODEC_OPUS / 2ch / 48000` in that case; when the offer names a codec, that one wins.
+
+| | |
+|---|---|
+| Session | display (not party chat) |
+| RTP | PT 111, one Opus packet per 20 ms (960 samples at 48 kHz) |
+| Opus | TOC `0xf8` (CELT fullband, mono, one frame), ~64 kbit/s, no DTX |
+| RTP extension | id 6, `ssrc-audio-level` (`0xff` in silence) |
+
+PT 111 is also the payload type of the headset audio we send *to* the pad; only the direction
+distinguishes them. **The uplink must not be handed to the input protocol decoder**: doing so
+logs every frame as `rtp_payload_undecodable` and throws the whole microphone away. The first
+byte `0xf8` is a legal Opus TOC, not a private header, and the packets go into an Ogg container
+unchanged.
+
+Two more traps worth writing down:
+
+- **Silence at full bitrate is not a format error.** A quiet room measures about
+  `mean -70 dB / max -31.7 dB` with all 64 kbit/s of frames present; speech nearby moves that
+  to `mean -34 dB / max -10.3 dB`. The encoder has no DTX, so there is no slow trickle to wait
+  for.
+- **The Ogg EOS page has zero lacing values.** Writing a single `0` lacing value declares an
+  empty *packet*, and ffmpeg ends an otherwise playable file with
+  `Packet processing failed: Invalid data found`. Ogg's CRC here is CRC-32 with poly
+  `0x04C11DB7`, init 0, no reflection and no final XOR (not the zlib variant); granulepos is
+  the running sum of RTP timestamp deltas.
+
+`microphone.py` packages the frames, with an optional long-lived ffmpeg decoding the same Ogg
+pages into live s16le PCM. The RTP callback never blocks on the decoder: pages go through a
+bounded queue drained by a writer thread, and a slow decoder drops pages instead of stalling
+input.
+
+Measured on a real controller (`ota.282115`): a 33.08 s capture was 1655 packets / 266 kB and
+played straight from the Ogg file; a 7.20 s Assistant-button push-to-talk gave 359 packets,
+peak -19.5 dB, mean -37.0 dB, with the #5 request logged 7.474 s before its release. The
+switch is repeatable: each of the two 6 s "on" windows produced 295 packets (49/s).
+
 ## 6. The game session (`schemas/streamer_message.proto`, `game_session.py`)
 
 Game streaming is a second WebRTC session, and it is the only path to the rumble motors.

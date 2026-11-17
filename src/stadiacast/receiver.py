@@ -548,6 +548,8 @@ class Receiver:
             return self._control(req)
         if path == "/_audio":
             return await self._audio(req)
+        if path == "/_mic":
+            return self._mic(req)
         if path in self.cfg.offer_on:
             ctl = await self.controller_for(req)
             if ctl is not None:
@@ -619,6 +621,49 @@ class Receiver:
             return self._json(400, {"error": str(e)}, handler="audio")
         out["controller"] = picked.label
         return self._json(200, out, handler="audio")
+
+    def _mic(self, req: HttpRequest) -> HttpResponse:
+        """``/_mic``: the controller's microphone.
+
+        ``GET`` reports the state and the capture files, and ignores any body, so a read never
+        opens the microphone.  ``POST`` takes ``{"do": ...}``: ``on`` / ``off`` (the
+        ``DisplayToController`` #5 switch), ``pcm`` (``on``: live PCM decoding) or ``ptt``
+        (``on``: the Assistant button becomes push to talk).
+        """
+        body: dict[str, Any] = {}
+        if req.method == "GET":
+            picked = self._pick(req)
+            if isinstance(picked, HttpResponse):
+                return picked
+            return self._json(200, picked.mic_state(), handler="mic")
+        if req.method != "POST":
+            return HttpResponse(405, b"", handler="mic")
+        if req.body.strip():
+            try:
+                parsed = json.loads(req.body)
+                body = parsed if isinstance(parsed, dict) else {}
+            except ValueError:
+                return self._json(400, {"error": "the body is not JSON"}, handler="mic")
+        picked = self._pick(req, body)
+        if isinstance(picked, HttpResponse):
+            return picked
+        action = body.get("do")
+        if action == "on":
+            out: dict[str, Any] = picked.mic_start(reason="api")
+        elif action == "off":
+            out = picked.mic_stop(reason="api")
+        elif action == "pcm":
+            out = picked.set_mic_pcm(bool(body.get("on", True)))
+        elif action == "ptt":
+            out = picked.set_mic_ptt(bool(body.get("on", True)))
+        else:
+            return self._json(
+                400,
+                {"error": f"unknown do={action!r}", "actions": ["on", "off", "pcm", "ptt"]},
+                handler="mic",
+            )
+        out["controller"] = picked.label
+        return self._json(200, out, handler="mic")
 
     def _events(self, req: HttpRequest) -> HttpResponse:
         """``GET /_events``: the live state as server-sent events (:class:`LiveStream`)."""
