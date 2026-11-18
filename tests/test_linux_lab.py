@@ -10,6 +10,7 @@ microphone" for as long, and skip without a sound server or ffmpeg."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ctypes
 import errno
 import os
@@ -598,3 +599,82 @@ def test_a_sink_that_is_taken_from_the_receiver_is_never_played_elsewhere(tmp_pa
         for line in left:
             subprocess.run(["pactl", "unload-module", line.split()[0]], check=False, timeout=10)
     assert left == []
+
+
+def test_the_headset_never_hears_a_microphone_when_its_output_goes(tmp_path) -> None:
+    """``--audio-source system`` with a real sound server, and the controllers' microphones a device
+    of it: the output whose sound the headset gets goes away. The sound server moves the capture,
+    PulseAudio onto the default microphone and PipeWire onto the next output, which can be the
+    microphones' own sink. The capture is never on either: it goes on with another output of the
+    computer, or ends and starts again once its output is back."""
+    if ffmpeg_path() is None:
+        pytest.skip("needs ffmpeg (with libopus) on PATH")
+    tools = [shutil.which(tool) for tool in ("pactl", "pacat", "parec")]
+    if None in tools or subprocess.run(["pactl", "info"], capture_output=True, timeout=10, check=False).returncode:
+        pytest.skip("needs a PulseAudio or PipeWire server that pactl reaches, with pacat and parec")
+
+    def pactl(*args: str) -> str:
+        said = subprocess.run(
+            ["pactl", *args], capture_output=True, text=True, timeout=10, check=True, env={**os.environ, "LC_ALL": "C"}
+        )
+        return said.stdout.strip()
+
+    def default_sink() -> str:
+        return next(line.partition(": ")[2] for line in pactl("info").splitlines() if line.startswith("Default Sink"))
+
+    def captured_from() -> list[str]:
+        """The sources the receiver's headset capture records, as the sound server has it now."""
+        names = {line.split()[0]: line.split()[1] for line in pactl("list", "short", "sources").splitlines()}
+        found = []
+        for stream in pactl("list", "source-outputs").split("\n\n"):
+            if 'application.name = "Stadiacast"' in stream and 'media.name = "headset"' in stream:
+                source = next(line.split()[1] for line in stream.splitlines() if line.strip().startswith("Source:"))
+                found.append(names.get(source, source))
+        return found
+
+    output = default_sink()
+    load = ["load-module", "module-null-sink", "sink_name=headset_lab_out", "rate=48000", "channels=2"]
+    sink = pactl(*load)
+
+    async def run() -> None:
+        rx = make_receiver(tmp_path, audio_source="system", mic="on", mic_device="")
+        await rx.start()
+        fc = await connect_firmware_flow(rx)
+        try:
+            await asyncio.wait_for(fc.display_ready.wait(), 5)
+            await fc.keepalive()
+            await wait_for(lambda: rx.log.counts.get("audio_capture", 0) >= 1, timeout=15)
+            started = next(r for r in rx.log.records if r["event"] == "audio_capture")
+            assert started["device"] == "headset_lab_out.monitor", started
+            await wait_for(lambda: captured_from() == ["headset_lab_out.monitor"], timeout=5)
+            pactl("unload-module", sink)
+            seen: set[str] = set()
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline:
+                seen.update(captured_from())
+                await asyncio.sleep(0.02)
+            wrong = [s for s in seen if not s.endswith(".monitor") or s == "stadiacast_mic_feed.monitor"]
+            ended = [r for r in rx.log.records if r["event"] == "audio_capture_ended"]
+            print(f"the headset's capture went on {sorted(seen)}; ended: {[r['error'] for r in ended]}")
+            assert wrong == [], f"the headset's capture was on {wrong}"
+            if ended:  # it ended: it starts again once its output is back
+                assert "moved the capture" in str(ended[0]["error"]) or "parec ended" in str(ended[0]["error"])
+                again = pactl(*load)
+                pactl("set-default-sink", "headset_lab_out")
+                try:
+                    await wait_for(lambda: "headset_lab_out.monitor" in captured_from(), timeout=20)
+                finally:
+                    pactl("unload-module", again)
+        finally:
+            fc.close()
+            await rx.stop()
+
+    pactl("set-default-sink", "headset_lab_out")
+    try:
+        asyncio.run(run())
+    finally:
+        with contextlib.suppress(subprocess.CalledProcessError):
+            pactl("set-default-sink", output)
+        for line in pactl("list", "short", "modules").splitlines():
+            if "headset_lab_out" in line or "stadiacast_mic" in line:
+                subprocess.run(["pactl", "unload-module", line.split()[0]], check=False, timeout=10)

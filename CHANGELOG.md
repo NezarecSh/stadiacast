@@ -26,6 +26,11 @@ All notable changes to this project are documented here. The format follows
 - On macOS, `--audio-source system` takes BlackHole 2ch when there are several loopback
   devices, whatever order the Mac lists them in.
 
+### Fixed
+- On Linux with PulseAudio, the headset no longer hears a microphone of the computer when the
+  output its sound is captured from goes away: the sound server moved the capture onto the
+  default microphone. It stops there now, and starts again when that output is back.
+
 ## [1.2.1] - 2026-11-16
 
 A virtual Stadia Controller on Linux, with the Assistant and Capture buttons that an Xbox pad

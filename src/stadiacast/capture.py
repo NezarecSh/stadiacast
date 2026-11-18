@@ -26,6 +26,7 @@ import abc
 import contextlib
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -277,18 +278,28 @@ class PulseSource(CaptureDevice):
 
 
 class PulseCapture(BlockCapture):
-    """``parec`` writing raw PCM into a pipe, which a thread cuts into blocks."""
+    """``parec`` writing raw PCM into a pipe, which a thread cuts into blocks.
+
+    A sound server moves a recording whose output goes away: PulseAudio to the default source,
+    which is a microphone, PipeWire to the monitor of the next output, which can be the sink the
+    controllers' microphones are played into. Either way the headset would hear a microphone.
+    ``parec`` says where its stream is (``-v``), and is ended the moment that is anything but
+    the monitor of an output of the computer.
+    """
 
     def __init__(self, device: PulseSource) -> None:
         super().__init__(device.name, device.rate, device.channels)
         self._executable = device.executable
         self._proc: subprocess.Popen[bytes] | None = None
         self._thread: threading.Thread | None = None
+        self._says: threading.Thread | None = None
+        self._said = ""  # the last thing parec said
         self._stopped = False
 
     def start(self) -> None:
         if self._stopped:  # stopped before it opened
             return
+        user = sound_server_user()
         proc = subprocess.Popen(
             [
                 self._executable,
@@ -300,31 +311,59 @@ class PulseCapture(BlockCapture):
                 "--latency-msec=20",  # one block at a time: the default hands over seconds at once
                 "--client-name=Stadiacast",
                 "--stream-name=headset",
+                "-v",  # where the stream is: see the class
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            **sound_server_user(),
+            **{**user, "env": {**user.get("env", os.environ), "LC_ALL": "C"}},  # what it says is read
         )
         self._proc = proc
+        self._says = threading.Thread(target=self._listen, args=(proc,), name="parec-says", daemon=True)
+        self._says.start()
         self._thread = threading.Thread(target=self._read, args=(proc,), name="parec", daemon=True)
         self._thread.start()
         if self._stopped:  # stopped while it was starting, on another thread
             self.stop()
 
+    def _listen(self, proc: subprocess.Popen[bytes]) -> None:
+        """What ``parec`` says: where its stream is, and in the end why it ended."""
+        assert proc.stderr is not None
+        held = b""
+        with contextlib.suppress(OSError, ValueError):
+            while chunk := os.read(proc.stderr.fileno(), 1024):  # what is there: it says a line at a time
+                *lines, held = (held + chunk).replace(b"\r", b"\n").split(b"\n")
+                for raw in lines:
+                    line = raw.replace(b"\x1b[K", b"").decode("utf-8", "replace").strip()
+                    if not line or line.startswith("Time:"):
+                        continue
+                    self._said = line
+                    at = re.match(r"(?:Connected to|Stream moved to) device (\S+) \(", line)
+                    if at and not self._may_record(at.group(1)):
+                        self.error = f"the sound server moved the capture to {at.group(1)!r}: it was ended"
+                        proc.kill()
+        if held.strip():
+            self._said = held.decode("utf-8", "replace").strip()
+
+    def _may_record(self, device: str) -> bool:
+        """The monitor it was asked for, or the monitor of another output of the computer. Never
+        a microphone, nor the sink the controllers' microphones are played into."""
+        return device == self.name or (device.endswith(".monitor") and device != f"{MIC_FEED_SINK}.monitor")
+
     def _read(self, proc: subprocess.Popen[bytes]) -> None:
         size = BLOCK * self.channels * 2
-        assert proc.stdout is not None and proc.stderr is not None
+        assert proc.stdout is not None
         try:
             while len(block := proc.stdout.read(size)) == size:
                 self._push(block)
         except (OSError, ValueError):  # the pipe was closed under the read
             pass
-        if not self._stopped:  # it ended by itself: the sound server went away, or never answered
-            said = proc.stderr.read().decode("utf-8", "replace").strip().splitlines()
-            self.error = f"parec ended: {said[-1] if said else 'no message'}"
-        with contextlib.suppress(OSError):
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
             proc.wait(timeout=2)
+        if self._says is not None:
+            self._says.join(1)  # what parec said last is read by then
+        if not self._stopped and self.error is None:  # it ended by itself: the server went away, or never answered
+            self.error = f"parec ended: {self._said or 'no message'}"
         self._mark_end()
 
     def stop(self) -> None:
@@ -340,8 +379,9 @@ class PulseCapture(BlockCapture):
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
             proc.kill()
-        if self._thread is not None and self._thread is not threading.current_thread():
-            self._thread.join(2)
+        for thread in (self._thread, self._says):
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(2)
         for pipe in (proc.stdout, proc.stderr):
             if pipe is not None:
                 with contextlib.suppress(OSError):

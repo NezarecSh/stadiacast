@@ -473,6 +473,7 @@ MONITOR_ARGS = [
     "--latency-msec=20",
     "--client-name=Stadiacast",
     "--stream-name=headset",
+    "-v",
 ]
 
 
@@ -516,6 +517,48 @@ def test_a_recorder_that_ends_by_itself_says_why(tmp_path, monkeypatch) -> None:
     stopped_early.stop()  # before it was started: nothing runs, and a start after it does nothing
     stopped_early.start()
     assert stopped_early.read(0.1) is None and stopped_early.error is None
+
+
+@posix_only
+@pytest.mark.parametrize(
+    ("moved_to", "ends"),
+    [
+        ("alsa_input.usb-headset.mono-fallback", True),  # PulseAudio: the default source, a microphone
+        ("stadiacast_mic_feed.monitor", True),  # PipeWire: the next output, the controllers' microphones
+        ("alsa_output.pci-0000_00_1f.3.analog-stereo.monitor", False),  # PipeWire: another output of the computer
+    ],
+)
+def test_a_capture_that_the_sound_server_moves_onto_a_microphone_is_ended(tmp_path, monkeypatch, moved_to, ends):
+    """A sound server moves a recording whose output goes away. Onto a microphone, or onto the
+    sink the controllers' microphones are played into, the headset would hear a microphone: the
+    capture ends there. Onto another output of the computer it goes on."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    _tool(tmp_path, "pactl", "echo alsa_output.usb-headphones.analog-stereo\n")
+    _tool(
+        tmp_path,
+        "parec",
+        'echo "Connected to device alsa_output.usb-headphones.analog-stereo.monitor (index: 3, suspended: no)." >&2\n'
+        f'head -c {2 * BLOCK_BYTES} /dev/zero | tr "\\0" A\n'
+        'printf "Time: 0.040 sec; Latency: 20000 usec.\\r" >&2\n'
+        f'echo "Stream moved to device {moved_to} (7, not suspended)." >&2\n'
+        f'head -c {2 * BLOCK_BYTES} /dev/zero | tr "\\0" B\n'
+        "exec sleep 30\n",
+    )
+    cap = capture.linux_monitor().capture()
+    cap.start()
+    try:
+        assert [cap.read(5.0) for _ in range(2)] == [b"A" * BLOCK_BYTES] * 2
+        if ends:
+            deadline = time.monotonic() + 5
+            while (block := cap.read(0.1)) is not None:  # a block it read before it was ended, at most
+                assert block in (b"B" * BLOCK_BYTES, b"") and time.monotonic() < deadline
+            assert cap.error == f"the sound server moved the capture to {moved_to!r}: it was ended"
+        else:
+            assert [cap.read(5.0) for _ in range(2)] == [b"B" * BLOCK_BYTES] * 2
+            assert cap.read(0.1) == b"" and cap.error is None  # still there
+    finally:
+        cap.stop()
 
 
 @posix_only

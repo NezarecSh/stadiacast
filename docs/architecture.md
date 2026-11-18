@@ -124,7 +124,8 @@ another output, and unloads both at the end; `WasapiOutput` (Windows) and `PortA
 take only a cable; they refuse the computer's own speakers and the device the headset's sound
 is captured from, and a device that was named and does not look like a cable is taken with a
 note that says so. An output that stops asking, or whose device is gone, is opened again by the
-`MicrophoneDevice` until it is back, and a voice whose ffmpeg ended gets a new one.
+`MicrophoneDevice` until it is back, and a voice whose ffmpeg ended gets a new one. The headset's
+capture on Linux (`PulseCapture`) ends where the sound server would move it onto a microphone.
 
 The switch is the session's to keep true. Its request is one datagram, so it is sent again
 when neither an answer nor the sound comes within a second, four times in all; a controller
