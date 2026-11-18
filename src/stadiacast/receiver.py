@@ -200,6 +200,7 @@ class Receiver:
             clearcut_block=self.cfg.clearcut_block,
             rpc_wire_id=f"{self.cfg.rpc_wire_id:#04x}",
             start_game=self.cfg.start_game,
+            mic_capture=self.cfg.mic_capture,
             log_dir=self.cfg.log_dir,
         )
 

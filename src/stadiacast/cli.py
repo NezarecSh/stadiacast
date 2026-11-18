@@ -515,6 +515,13 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
     )
 
 
+#: What the start says when ``--mic-capture`` will make microphones record.
+MIC_NOTICES = {
+    "on": "the controllers' microphones are recorded for as long as they are connected (--mic-capture on).",
+    "ptt": "the controllers' microphones are recorded while their Assistant button is held (--mic-capture ptt).",
+}
+
+
 async def amain(cfg: Config) -> int:
     receiver = Receiver(cfg)
     stop = receiver.stop_requested  # Ctrl-C, SIGTERM or POST /_shutdown
@@ -526,10 +533,12 @@ async def amain(cfg: Config) -> int:
             pass
     try:
         await receiver.start()
+        recorded = MIC_NOTICES.get(cfg.mic_capture)
         print(
             f"\nstadiacast {__version__} ready: https :{receiver.http.https_port}  http {receiver.http.http_ports}  "
             f"udp {cfg.advertise_ip}:{cfg.udp_port}/{cfg.game_udp_port} (+2 per controller)  logs {cfg.log_dir}\n"
-            "wake the controller(s) now; Ctrl-C to stop.\n",
+            + (f"{recorded}\n" if recorded else "")
+            + "wake the controller(s) now; Ctrl-C to stop.\n",
             flush=True,
         )
         await stop.wait()

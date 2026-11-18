@@ -238,6 +238,32 @@ def test_a_shutdown_request_stops_the_receiver_as_ctrl_c_does(tmp_path, capsys):
     assert events(tmp_path)[-1] == "stopped" and "shutdown_requested" in events(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("mode", "says"),
+    [("off", None), ("on", "for as long as they are connected"), ("ptt", "while their Assistant button is held")],
+)
+def test_the_start_says_when_microphones_are_recorded(tmp_path, capsys, mode, says):
+    async def run() -> str:
+        task = asyncio.get_running_loop().create_task(cli.amain(lab_config(tmp_path, mic_capture=mode)))
+        out = ""
+        for _ in range(200):
+            out += capsys.readouterr().out
+            if "wake the controller(s) now" in out:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return out
+
+    out = asyncio.run(run())
+    assert "ready: https" in out
+    if says is None:
+        assert "microphone" not in out
+    else:
+        assert f"the controllers' microphones are recorded {says} (--mic-capture {mode})." in out
+
+
 def test_a_start_that_fails_stops_what_it_started_and_reports_the_port(tmp_path, capsys):
     with socket.socket() as holder:
         holder.bind(("127.0.0.1", 0))
