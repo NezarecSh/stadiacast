@@ -1699,6 +1699,7 @@ def test_a_device_that_cannot_be_had_stops_the_start(tmp_path: Path, monkeypatch
         raise SetupError("no virtual cable to play the microphone into: install VB-CABLE")
 
     monkeypatch.setattr(receiver, "open_output", none)
+    monkeypatch.setattr(receiver, "ffmpeg_path", lambda: "ffmpeg")  # there is one: the device is what fails
 
     async def run() -> None:
         rx = make_receiver(tmp_path, mic="on", mic_device="")
