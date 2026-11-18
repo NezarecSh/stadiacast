@@ -566,9 +566,15 @@ def microphone_notice(cfg: Config, heard_as: str | None, note: str | None = None
 
 async def amain(cfg: Config) -> int:
     receiver = Receiver(cfg)
-    stop = receiver.stop_requested  # Ctrl-C, SIGTERM or POST /_shutdown
+    stop = receiver.stop_requested  # Ctrl-C, SIGTERM, a terminal that closes, or POST /_shutdown
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    signals = [signal.SIGINT, signal.SIGTERM]
+    # A terminal that closes ends the receiver as Ctrl-C does, with what it made: the helpers, the
+    # virtual pads, the microphone's device. Not under nohup, which is there to keep it running.
+    hangup = getattr(signal, "SIGHUP", None)
+    if hangup is not None and signal.getsignal(hangup) is not signal.SIG_IGN:
+        signals.append(hangup)
+    for sig in signals:
         try:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:

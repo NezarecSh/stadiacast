@@ -21,6 +21,8 @@ All notable changes to this project are documented here. The format follows
   address.
 
 ### Changed
+- A receiver whose terminal is closed stops as Ctrl-C stops it, with its helper processes, the
+  virtual pads and the microphone's device. One started with `nohup` goes on running.
 - On macOS, `--audio-source system` takes BlackHole 2ch when there are several loopback
   devices, whatever order the Mac lists them in.
 

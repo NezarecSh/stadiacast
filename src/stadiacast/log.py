@@ -7,6 +7,7 @@ rendering of the same record with the bulky fields left out unless ``verbose``.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import json
 import sys
@@ -109,14 +110,20 @@ class EventLog:
                     # A full disk must not take the links down with it: every datagram and request
                     # handler logs.  The file is given up, the console and the memory go on.
                     self._fh = None
-                    print(f"stadiacast: the log {self.path} can no longer be written ({e})", file=sys.stderr)
+                    with contextlib.suppress(OSError, ValueError):
+                        print(f"stadiacast: the log {self.path} can no longer be written ({e})", file=sys.stderr)
             self.records.append(rec)
         if self.echo and not _quiet:
             try:
                 line = self.format(rec)
             except Exception as e:  # formatting must never take the server down
                 line = f"[{rec['ts'][11:23]}] {event} (format error {e!r}) {json.dumps(fields, default=str)[:300]}"
-            print(line, flush=True)
+            try:
+                print(line, flush=True)
+            except (OSError, ValueError):
+                # The terminal is gone (it was closed, the SSH session dropped): the receiver
+                # stops on that signal, and must get through its stop. The file goes on.
+                self.echo = False
         return rec
 
     def bind(self, **context: Any) -> BoundLog:

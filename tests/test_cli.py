@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -236,6 +237,56 @@ def test_a_shutdown_request_stops_the_receiver_as_ctrl_c_does(tmp_path, capsys):
 
     assert asyncio.run(run()) == 0
     assert events(tmp_path)[-1] == "stopped" and "shutdown_requested" in events(tmp_path)
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="Windows has no hangup signal")
+def test_a_terminal_that_closes_stops_the_receiver_as_ctrl_c_does(tmp_path, capsys, monkeypatch):
+    """A hangup ends the receiver through its stop, which takes away what it made: here the
+    microphone's device. The terminal is gone by then, and every write to it fails. Under nohup
+    the signal is ignored, and stays so: the receiver is meant to outlive its terminal there."""
+    from stadiacast import receiver
+    from tests.test_micdevice import Asked
+
+    class Gone:
+        def write(self, _text: str) -> int:
+            raise OSError(5, "Input/output error")
+
+        def flush(self) -> None:
+            raise OSError(5, "Input/output error")
+
+    device = Asked()
+    monkeypatch.setattr(receiver, "open_output", lambda _name, **_kw: device)
+    monkeypatch.setattr(receiver, "ffmpeg_path", lambda: "ffmpeg")  # no controller comes: nothing is decoded
+    monkeypatch.setattr("stadiacast.micdevice.ffmpeg_path", lambda: "ffmpeg")
+    handled: list[int] = []
+
+    async def run(hang_up: bool) -> int | None:
+        loop = asyncio.get_running_loop()
+        plain = loop.add_signal_handler
+        monkeypatch.setattr(loop, "add_signal_handler", lambda sig, *a: (handled.append(sig), plain(sig, *a))[1])
+        task = loop.create_task(cli.amain(lab_config(tmp_path, echo=True, mic_device="")))
+        for _ in range(200):
+            if "ready: https" in capsys.readouterr().out:
+                break
+            await asyncio.sleep(0.01)
+        if hang_up:
+            monkeypatch.setattr("sys.stdout", Gone())
+            os.kill(os.getpid(), signal.SIGHUP)
+            return await asyncio.wait_for(task, 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return None
+
+    monkeypatch.setattr(signal, "getsignal", lambda _sig: signal.SIG_DFL)  # whatever started the tests
+    assert asyncio.run(run(hang_up=True)) == 0
+    assert signal.SIGHUP in handled and events(tmp_path)[-1] == "stopped"
+    assert (device.started, device.stopped) == (1, 1) and "mic_device_removed" in events(tmp_path)
+    monkeypatch.setattr("sys.stdout", sys.__stdout__)
+    handled.clear()
+    monkeypatch.setattr(signal, "getsignal", lambda _sig: signal.SIG_IGN)  # as nohup leaves it
+    asyncio.run(run(hang_up=False))
+    assert handled and signal.SIGHUP not in handled
 
 
 @pytest.mark.parametrize(

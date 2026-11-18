@@ -74,3 +74,23 @@ def test_a_log_file_that_can_no_longer_be_written_does_not_raise(tmp_path, capsy
     err = capsys.readouterr().err
     assert err.count("can no longer be written") == 1 and "No space left on device" in err
     log.close()
+
+
+def test_a_terminal_that_is_gone_ends_the_echo_and_not_the_log(tmp_path, monkeypatch):
+    """Once its terminal is closed, every write to it fails. The receiver stops on that signal and
+    logs as it stops: the console echo ends there, the file goes on."""
+
+    class Gone:
+        def write(self, _text: str) -> int:
+            raise OSError(5, "Input/output error")
+
+        def flush(self) -> None:
+            raise OSError(5, "Input/output error")
+
+    log = EventLog(str(tmp_path / "server.jsonl"), echo=True)
+    monkeypatch.setattr("sys.stdout", Gone())
+    assert log("stopping", n=1)["n"] == 1 and log.echo is False
+    log("stopped")
+    log.close()
+    lines = (tmp_path / "server.jsonl").read_text().splitlines()
+    assert [json.loads(line)["event"] for line in lines] == ["stopping", "stopped"]
