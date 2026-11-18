@@ -12,12 +12,7 @@ All notable changes to this project are documented here. The format follows
   run directory. `--mic-pcm` also decodes it to live s16le PCM through ffmpeg, and `--mic-ptt`
   makes the Assistant button push to talk. `GET /_mic` and `POST /_mic` inspect and control it
   while the receiver runs; `/_status` reports it under `microphone`. All three are off by
-  default. The SDP answer now names Opus when the pad offers an audio SSRC but no codec of its
-  own.
-
-### Fixed
-- An offer with `audio_ssrc` and no `audio_format` no longer gets an answer with no audio
-  codec, which left the controller with nothing to encode its microphone into.
+  default.
 
 ## [1.2.1] - 2026-11-16
 

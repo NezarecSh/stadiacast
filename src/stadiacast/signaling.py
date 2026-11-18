@@ -113,13 +113,6 @@ def build_answer(protos: Protos, offer: Any, endpoint: RtcEndpoint, *, boreal: s
             a.video_format.CopyFrom(offer.video_format[0])
     if offer.audio_format:
         a.audio_format.CopyFrom(offer.audio_format[0])
-    elif offer.audio_ssrc:
-        # The pad can offer an audio SSRC and no codec at all: the answerer picks one.  Leaving
-        # the answer empty tells it there is no usable audio codec, and it then has nothing to
-        # encode its microphone into (or to decode our headset stream from).
-        a.audio_format.codec = protos.enum(f"{PKG_API}.RtcSdpAudioCodec", "AUDIO_CODEC_OPUS")
-        a.audio_format.channels = 2
-        a.audio_format.sample_rate = 48000
     a.raw_dtls = offer.raw_dtls
     a.delayed_acks = offer.delayed_acks
     a.disable_game_stats = True

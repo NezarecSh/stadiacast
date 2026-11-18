@@ -226,10 +226,6 @@ still show `rtp_in: 0` on their own. What it does need is one request:
    stops it. The response is an empty OK, so a receiver that never sends #5 sees a perfectly
    healthy link and no audio at all. A/B on hardware (6 s windows): `false` +22 packets,
    `true` +295, `false` +21, `true` +295 -- 49/s, exactly one 20 ms frame.
-2. **A codec in the answer.** The pad can offer an `audio_ssrc` with `audio_format=[]`:
-   the answerer chooses. An answer with no `audio_format` tells it there is no usable codec,
-   and it has nothing to encode into. `build_answer()` now replies with
-   `AUDIO_CODEC_OPUS / 2ch / 48000` in that case; when the offer names a codec, that one wins.
 
 | | |
 |---|---|

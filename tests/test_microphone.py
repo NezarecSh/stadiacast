@@ -115,16 +115,15 @@ def test_pcm_without_ffmpeg_degrades_gracefully(tmp_path: Path, monkeypatch: Any
     assert b"OpusHead" in (tmp_path / "mic.ogg").read_bytes()
 
 
-def test_the_answer_picks_opus_when_the_offer_has_no_codec():
-    """The pad offers an audio SSRC with audio_format=[]; the answerer has to name a codec."""
+def test_the_answer_names_no_codec_when_the_offer_names_none():
+    """A controller offers an audio SSRC and no audio format, and the answer names none either:
+    that is the answer a controller sends its microphone on."""
     p = Protos()
     offer = p.RtcSdpOffer()
     offer.audio_ssrc = 0x049A6E9C
     ep = SimpleNamespace(local_params=lambda: {"ice_ufrag": "u", "ice_password": "pw", "fingerprint": "sha-256 AA"})
-    answer = build_answer(p, offer, ep).sdp_answer  # type: ignore[arg-type]
-    assert answer.audio_format.codec == p.enum(f"{PKG_API}.RtcSdpAudioCodec", "AUDIO_CODEC_OPUS")
-    assert (answer.audio_format.channels, answer.audio_format.sample_rate) == (2, 48000)
-    # An offer that does name a codec still wins.
+    assert not build_answer(p, offer, ep).sdp_answer.HasField("audio_format")  # type: ignore[arg-type]
+    # A codec the offer does name is the answer's.
     fmt = offer.audio_format.add()
     fmt.codec = p.enum(f"{PKG_API}.RtcSdpAudioCodec", "AUDIO_CODEC_OPUS")
     fmt.channels, fmt.sample_rate = 1, 16000
