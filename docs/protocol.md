@@ -96,8 +96,9 @@ firmware also offers IPv6 link-local and ULA candidates, which the IPv4 socket s
   template says `a=setup:passive`, yet on the display link the controller acts as the DTLS
   **client**, so the `live` preset uses `--dtls-role server`. `auto` becomes the server when a
   ClientHello arrives first and the client 0.5 s after the pair is verified otherwise.
-- **SRTP** (RFC 3711 AES-CM/HMAC-SHA1 and RFC 7714 AES-GCM) is implemented for completeness;
-  with `raw_dtls` (what the controller offers) no SRTP flows.
+- **SRTP** (RFC 3711 AES-CM/HMAC-SHA1 and RFC 7714 AES-GCM). With `raw_dtls` (what the
+  controller offers) input and RPCs travel inside DTLS, in the framing below, and SRTP
+  carries the sound: the headset stream one way and the microphone the other (§5).
 
 ### WireHeader2 (`raw_dtls`)
 
@@ -143,8 +144,8 @@ The sequence after `dtls-connected`:
    (the firmware computes `rtt = now - echo` and `CHECK`-fails when negative) plus
    `display_time_us`; `NOT_FOUND` (5) makes it stop syncing. Unknown requests are answered
    `UNIMPLEMENTED` (12), the controller's own reaction to requests it does not implement.
-5. In READY the controller reports **input** (#3, below) and accepts **`StartGame`** (§6).
-   `DisconnectRequest` (#8) is answered with an empty OK.
+5. In READY the controller reports **input** (#3, below) and accepts **`StartGame`** (§6)
+   and **`set_microphone`** (#5, below). `DisconnectRequest` (#8) is answered with an empty OK.
 
 ### Input report (`ControllerToDisplay` #3)
 
@@ -193,7 +194,8 @@ The jack is fed by a normal RTP stream on the ICE pair the handshake selected, n
 1. **`SetAudioModeRequest` (`DisplayToController` #16) with `mode=2, f3=true`.** The firmware's
    mode table maps 1, 2 and 4 to its audio paths and rejects 3 as
    `Unsupported audio mode: UDP_PCM`; only mode 2 (the WebRTC Opus route) reaches the jack.
-   Send it before the first frame: without it the pad takes the packets and plays nothing.
+   Send it before the first frame: without it the controller takes the packets and plays
+   nothing.
 2. **Media on the media 5-tuple.** `0x66` carries input reports and RPCs. Audio pushed into it
    is accepted by the socket and silently dropped by the firmware (measured on hardware).
 
@@ -217,50 +219,49 @@ Three more details, each found by getting it wrong on a real controller:
 
 ### The controller's microphone
 
-The pad's own microphone is the *other* direction of the same audio m-line. It needs no party
-chat, no SCTP data channel and no second WebRTC session -- all of which can be built and will
-still show `rtp_in: 0` on their own. What it does need is one request:
+The controller sends its microphone when the display asks for it and at no other time: with
+the request never made, no packet of sound has arrived in any session, whatever was pressed.
 
-1. **`DisplayToController` #5 (`BoolValue`) = `true`.** This is the microphone capture switch.
-   Opus starts on the display link within a frame or two, at one packet every 20 ms; `false`
-   stops it. The response is an empty OK, so a receiver that never sends #5 sees a perfectly
-   healthy link and no audio at all. A/B on hardware (6 s windows): `false` +22 packets,
-   `true` +295, `false` +21, `true` +295 -- 49/s, exactly one 20 ms frame.
+**`set_microphone`** (`DisplayToController` #5, a `BoolValue`) is the switch. `true` is
+answered with an empty OK and the sound follows; `false` is answered the same way, and no
+packet comes after it. A `false` to a microphone that is off gets its OK too. The receiver
+sends the request once the link is READY, and nothing has to be said first: the SDP answer
+names no audio format (the offer names none), no `SetAudioModeRequest` is needed and neither
+is a game session. A boot starts with the microphone off. The request is one datagram like
+every RPC here, so the receiver sends it again when neither the OK nor the sound has come
+after a second, and tells a controller to stop whose sound arrives unasked.
 
-| | |
-|---|---|
-| Session | display (not party chat) |
-| RTP | PT 111, one Opus packet per 20 ms (960 samples at 48 kHz) |
-| Opus | TOC `0xf8` (CELT fullband, mono, one frame), ~64 kbit/s, no DTX |
-| RTP extension | id 6, `ssrc-audio-level` (`0xff` in silence) |
+The sound takes the route of the headset stream in the other direction: SRTP on the ICE pair,
+never the `0x66` sub-channel, whatever the offer says about `raw_dtls`.
 
-PT 111 is also the payload type of the headset audio we send *to* the pad; only the direction
-distinguishes them. **The uplink must not be handed to the input protocol decoder**: doing so
-logs every frame as `rtp_payload_undecodable` and throws the whole microphone away. The first
-byte `0xf8` is a legal Opus TOC, not a private header, and the packets go into an Ogg container
-unchanged.
+```
+RTP         payload type 111 (the headset stream's too), the SSRC the offer names as
+            audio_ssrc, the marker never set; one packet every 20 ms, the sequence number
+            up by 1 and the timestamp by 960
+extension   id 6 (ssrc-audio-level in the offer), one byte, 0xff in every packet
+Opus        first byte 0xf8: CELT, full band, 20 ms, mono, one frame
+```
 
-Two more traps worth writing down:
+A packet is 161 bytes (64.4 kbit/s) while the sound is steady and between about 90 and 280
+bytes while it changes. A frame of digital silence is the three bytes `f8 ff fe`: a quiet room
+gives runs of them in the first seconds after a start. The firmware cleans the signal before
+it encodes it: a quiet room comes out at -80 dBFS and below, and speech at arm's length peaks
+near -14 dBFS. The controller sends no RTCP for the stream.
 
-- **Silence at full bitrate is not a format error.** A quiet room measures about
-  `mean -70 dB / max -31.7 dB` with all 64 kbit/s of frames present; speech nearby moves that
-  to `mean -34 dB / max -10.3 dB`. The encoder has no DTX, so there is no slow trickle to wait
-  for.
-- **The Ogg EOS page has zero lacing values.** Writing a single `0` lacing value declares an
-  empty *packet*, and ffmpeg ends an otherwise playable file with
-  `Packet processing failed: Invalid data found`. Ogg's CRC here is CRC-32 with poly
-  `0x04C11DB7`, init 0, no reflection and no final XOR (not the zlib variant); granulepos is
-  the running sum of RTP timestamp deltas.
-
-`microphone.py` packages the frames, with an optional long-lived ffmpeg decoding the same Ogg
-pages into live s16le PCM. The RTP callback never blocks on the decoder: pages go through a
-bounded queue drained by a writer thread, and a slow decoder drops pages instead of stalling
-input.
-
-Measured on a real controller (`ota.282115`): a 33.08 s capture was 1655 packets / 266 kB and
-played straight from the Ogg file; a 7.20 s Assistant-button push-to-talk gave 359 packets,
-peak -19.5 dB, mean -37.0 dB, with the #5 request logged 7.474 s before its release. The
-switch is repeatable: each of the two 6 s "on" windows produced 295 packets (49/s).
+- **Which microphone.** The controller's own, or the headset's when one is plugged in: taps on
+  the headset's microphone are loud in the stream then, and taps on the controller faint.
+- **How fast.** The controller's own microphone takes a third of a second to start: the OK
+  comes 0.30 to 0.34 s after the request and the first packet right behind it. With a headset
+  the OK takes 6 to 32 ms and the first packet comes 35 to 57 ms after the request; the sound
+  then begins with two clicks at full scale. Stopping takes 4 to 10 ms either way.
+- **The light.** The controller's light blinks for as long as its microphone is on, in a
+  pattern of its own.
+- **Alongside the rest.** The headset stream plays while the microphone is sent, and a game
+  session (§6) changes nothing: the sound stays on the display link.
+- **Loss.** Packets are lost on the air now and then: 9 of 3666 in the longest run, which was
+  73 s in one piece. The sequence numbers and timestamps say where, and the receiver puts a
+  packet in each such place that asks the decoder to conceal it, for up to a second in a
+  row, so a recording is as long as the sound was.
 
 ## 6. The game session (`schemas/streamer_message.proto`, `game_session.py`)
 
@@ -459,6 +460,9 @@ is never sent.
 - The game session flow of §6, the InitializationResponse string limits, the haptics watchdog.
 - Headset audio: Opus over SRTP on the media 5-tuple, gated by `SetAudioMode(mode=2)`, with
   its own SSRC, heard in the jack on a real controller.
+- The microphone: `set_microphone` (#5) and the Opus that follows as SRTP on the media
+  5-tuple under the offer's `audio_ssrc`, recorded from a real controller with its own
+  microphone and with a headset's.
 - The battery gauge (#10) and the headset notification (#4) of §5, both seen live, and the
   hardware fields of `GetControllerStateResponse`.
 - Omaha and Clearcut message formats, and the two ways a refused Clearcut handshake ends for

@@ -1,8 +1,8 @@
 """SRTP and SRTCP (RFC 3711 AES-CM/HMAC-SHA1 and RFC 7714 AES-GCM), keyed from the DTLS exporter.
 
 The controller offers ``SRTP_AES128_CM_SHA1_80``.  With ``raw_dtls`` sessions (what the firmware
-actually uses) no SRTP flows: traffic rides as DTLS application data instead.  The profiles are
-implemented for completeness and for the fake controller.
+actually uses) input and RPCs ride as DTLS application data, and SRTP carries the sound: the
+headset stream to the controller and its microphone back.  AES-GCM is there for completeness.
 """
 
 from __future__ import annotations
