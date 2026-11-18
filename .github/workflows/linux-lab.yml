@@ -3,9 +3,9 @@ name: Linux lab
 # The Linux-only paths against the real thing, by hand: the uinput device `--gamepad uinput`
 # creates, read back through its event device as a game reads it, a game's force feedback, the
 # whole path from the lab controller to the pad and back to its motors, the HID device
-# `--gamepad uhid` creates, and `--audio-source system` recording a tone from a PulseAudio
-# server. With ffmpeg installed, the audio tests that the regular CI skips run here too. Nothing
-# is released.
+# `--gamepad uhid` creates, `--audio-source system` recording a tone from a PulseAudio server,
+# and `--mic-device` making a microphone in it. With ffmpeg installed, the sound tests that the
+# regular CI skips run here too. Nothing is released.
 #
 # The pad tests need a kernel with uinput, and the Stadia pad's one with uhid. Where a runner's
 # kernel has none, the step that prepares it says so and they skip; point `runner` at a

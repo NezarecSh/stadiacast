@@ -2,12 +2,14 @@ name: Windows lab
 
 # The Windows-only paths on a Windows runner, by hand: the whole test suite on Windows, the ViGEm
 # pad against the real ViGEmBus driver (read back through XInput, rumble through ViGEm's
-# notification), the WASAPI loopback capture against a virtual audio device, and the Windows
-# executables. Nothing is released.
+# notification), the WASAPI loopback capture and the controller's microphone against a virtual
+# cable, and the Windows executables. With ffmpeg installed, the sound tests that the regular
+# CI skips run here too. Nothing is released.
 #
 # GitHub's hosted runners are Windows Server, which ships without the Xbox 360 controller driver a
-# ViGEm pad binds to and without any audio endpoint, so those two tests skip there and the run
-# verifies the rest. Point `runner` at a self-hosted Windows 10/11 runner for the full set.
+# ViGEm pad binds to, so that test skips there, and without any sound device: the virtual cable
+# installed below is the runner's one output and its one microphone. Point `runner` at a
+# self-hosted Windows 10/11 runner for the full set.
 
 on:
   workflow_dispatch:
@@ -36,8 +38,37 @@ jobs:
           enable-cache: true
       - run: uv sync --all-extras --group release --locked
 
+      - name: install ffmpeg and a virtual cable (VB-CABLE), for the sound tests
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          # hosted runners have no sound device and the Windows Audio service stopped: start it first
+          Set-Service Audiosrv -StartupType Automatic
+          Start-Service Audiosrv
+          Set-Service AudioEndpointBuilder -StartupType Automatic -ErrorAction SilentlyContinue
+          Start-Service AudioEndpointBuilder -ErrorAction SilentlyContinue
+          choco install ffmpeg -y --no-progress
+          # VB-CABLE through its own setup, which installs without a window
+          $pack = "$env:RUNNER_TEMP\vbcable"
+          Invoke-WebRequest -Uri "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip" -OutFile "$pack.zip"
+          $sum = (Get-FileHash "$pack.zip" -Algorithm SHA256).Hash
+          if ($sum -ne "B950E39F01AF1D04EA623C8F6D8EB9B6EA5C477C637295FABF20631C85116BFB") { throw "not the VB-CABLE package this step was written for: $sum" }
+          Expand-Archive -Force "$pack.zip" -DestinationPath $pack
+          $p = Start-Process -FilePath "$pack\VBCABLE_Setup_x64.exe" -ArgumentList "-i","-h" -Wait -PassThru
+          "VB-CABLE setup exit code: $($p.ExitCode)"
+          Start-Sleep -Seconds 8
+          # a program may record a microphone only where Windows' privacy settings allow it
+          $consent = "SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone"
+          foreach ($key in "HKLM:\$consent", "HKCU:\$consent", "HKCU:\$consent\NonPackaged") {
+            New-Item -Path $key -Force | Out-Null
+            Set-ItemProperty -Path $key -Name Value -Value Allow
+          }
+          Get-Service Audiosrv, AudioEndpointBuilder | Format-Table Status, Name -AutoSize
+          Get-PnpDevice -Class AudioEndpoint -ErrorAction SilentlyContinue | Format-Table Status, FriendlyName -AutoSize
+          exit 0
+
       - name: the whole test suite on Windows
-        run: uv run pytest -q
+        run: uv run pytest -q -rs
 
       - name: install the ViGEmBus driver
         shell: pwsh
@@ -48,21 +79,6 @@ jobs:
           "installer exit code: $($p.ExitCode)"
           if ($p.ExitCode -notin 0, 3010) { exit $p.ExitCode }
           Get-PnpDevice | Where-Object { $_.FriendlyName -like "*ViGEm*" -or $_.FriendlyName -like "*Virtual Gamepad*" } | Format-Table Status, FriendlyName -AutoSize
-
-      - name: install a virtual audio device (VB-CABLE) and ffmpeg, for the loopback capture
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          # hosted runners have no sound device and the Windows Audio service stopped: start it first
-          Set-Service Audiosrv -StartupType Automatic
-          Start-Service Audiosrv
-          Set-Service AudioEndpointBuilder -StartupType Automatic -ErrorAction SilentlyContinue
-          Start-Service AudioEndpointBuilder -ErrorAction SilentlyContinue
-          choco install ffmpeg -y --no-progress
-          choco install vb-cable -y --no-progress
-          Start-Sleep -Seconds 5
-          Get-Service Audiosrv, AudioEndpointBuilder | Format-Table Status, Name -AutoSize
-          Get-PnpDevice -Class AudioEndpoint -ErrorAction SilentlyContinue | Format-Table Status, FriendlyName -AutoSize
 
       - name: build and smoke-test the Windows executables
         shell: bash
