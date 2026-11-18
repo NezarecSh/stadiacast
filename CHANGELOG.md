@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-18
+
+The controller's microphone on the computer: a microphone that a voice chat or any other
+program can choose, on Linux, Windows and macOS, and recordings in the run directory.
+
 ### Added
 - The controller's microphone as a microphone of the computer. `--mic on` has it on for as long
   as a controller is connected and `--mic ptt` while its Assistant button is held, and
@@ -262,7 +267,8 @@ confirmed against real controllers running the last Wi-Fi firmware, `ota.282115`
   security policy, code of conduct.
 - MIT License, with a `NOTICE` for the three protobuf schemas reproduced from the firmware.
 
-[Unreleased]: https://github.com/jkfran/stadiacast/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/jkfran/stadiacast/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/jkfran/stadiacast/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/jkfran/stadiacast/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/jkfran/stadiacast/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/jkfran/stadiacast/compare/v1.1.0...v1.1.1
