@@ -243,10 +243,15 @@ Opus        first byte 0xf8: CELT, full band, 20 ms, mono, one frame
 ```
 
 A packet is 161 bytes (64.4 kbit/s) while the sound is steady and between about 90 and 280
-bytes while it changes. A frame of digital silence is the three bytes `f8 ff fe`: a quiet room
-gives runs of them in the first seconds after a start. The firmware cleans the signal before
-it encodes it: a quiet room comes out at -80 dBFS and below, and speech at arm's length peaks
-near -14 dBFS. The controller sends no RTCP for the stream.
+bytes while it changes. A frame of digital silence is the three bytes `f8 ff fe`: it is often
+the first packet after a start, and a quiet room can give a run of them in the seconds that
+follow. The firmware cleans the signal before it encodes it: a quiet room comes out at
+-80 dBFS and below, and speech at arm's length peaks near -14 dBFS. The controller sends no
+RTCP for the stream.
+
+The numbering goes on over the times the microphone is off. Within a boot, the first packet
+after a `true` has the sequence number of the last packet before the `false` plus 1 and its
+timestamp plus 960, however long the pause was. A boot starts both anew.
 
 - **Which microphone.** The controller's own, or the headset's when one is plugged in: taps on
   the headset's microphone are loud in the stream then, and taps on the controller faint.
