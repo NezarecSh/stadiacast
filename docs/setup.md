@@ -148,26 +148,28 @@ The run directory contains:
 | `server.jsonl` | the event log: one JSON object per line, `ts` and `event` plus fields |
 | `server.out` | the console echo of the log (one compact line per event) |
 | `bodies/` | every request body the controller sent, as raw bytes |
+| `mic_<controller>_<time>.ogg` | with `--mic-capture`, the recordings of a controller's microphone; with `--mic-pcm` a `.pcm` file beside each |
 | `dns.jsonl`, `sntp.jsonl` | the helper processes' logs |
 | `<IFACE>.pcap` | the packet capture (macOS), when enabled |
 
 `GET http://<receiver>/_status` returns the live state as JSON: per controller its session,
-battery level, headset and headset stream (`playback`), and with `--gamepad` every virtual pad
-under `gamepads`, with its XInput `slot` or the `error` it ended in; a macOS pad has no slot
-and names its `kind` and `profile`, a Linux pad its `kind` and its `device`: the event device
-a game reads (`/dev/input/event7`), or with `--gamepad uhid` the pad's `hidraw` node
-(`/dev/hidraw3`). `-v` echoes the bulky log fields (request bodies, decoded protobufs) to the
-console too.
+battery level, headset, headset stream (`playback`) and `microphone`, and with `--gamepad`
+every virtual pad under `gamepads`, with its XInput `slot` or the `error` it ended in; a macOS
+pad has no slot and names its `kind` and `profile`, a Linux pad its `kind` and its `device`:
+the event device a game reads (`/dev/input/event7`), or with `--gamepad uhid` the pad's
+`hidraw` node (`/dev/hidraw3`). `-v` echoes the bulky log fields (request bodies, decoded
+protobufs) to the console too.
 
 `GET /_input` is the short version, for a program that shows or uses what the controllers do:
 per controller the state of its link (`display_state`, `ready` or `input` once it is up), its
 `ip`, the seconds since it was last heard from (`last_seen_s`), `battery_percent`, `headset`,
-its virtual `gamepad`, and `input`, the latest report: the buttons held by name (`held`), the
-sticks (`lx`, `ly`, `rx`, `ry`, -32768 to 32767, up is positive) and the triggers (`l2`, `r2`,
-0 to 255). `GET /_events` sends the same document as server-sent events (`event: input`): one
-at once, one whenever something in it changes, and one every 2 s otherwise. A program that
-follows the controllers reads this stream instead of asking again and again, since every
-request is a record in the log. Eight streams can be open at a time.
+`microphone` (whether it was asked for its microphone), its virtual `gamepad`, and `input`, the
+latest report: the buttons held by name (`held`), the sticks (`lx`, `ly`, `rx`, `ry`, -32768 to
+32767, up is positive) and the triggers (`l2`, `r2`, 0 to 255). `GET /_events` sends the same
+document as server-sent events (`event: input`): one at once, one whenever something in it
+changes, and one every 2 s otherwise. A program that follows the controllers reads this stream
+instead of asking again and again, since every request is a record in the log. Eight streams
+can be open at a time.
 
 ```sh
 curl -s http://192.168.2.1/_input | jq '.controllers | map_values(.input.held)'
@@ -185,10 +187,18 @@ names an action, `{"do": "start", "source": "system"}` (optionally with `volume`
 `{"do": "mode", "mode": 2}`. With several controllers, `controller` names the target, as
 for `/_rumble`.
 
-`/_mic` does the same for the controller's microphone: `GET` reports it and a `POST` names an
-action, `{"do": "on"}` / `{"do": "off"}` (the capture switch), `{"do": "pcm", "on": true}` (live
-PCM decoding) or `{"do": "ptt", "on": true}` (the Assistant button as push to talk). The
-capture files land in the run directory; see [the README](../README.md#controller-microphone).
+`/_mic` is the same for a controller's microphone. `GET` shows the switch (`on`), the recording
+that is open (`recording`: its `file`, `seconds` and `packets`, and with `--mic-pcm` the
+`decoder` with the level of what it decoded last) and the one before it (`last`). A `POST`
+names an action: `{"do": "on"}` and `{"do": "off"}` switch the microphone, `{"do": "ptt", "on":
+true}` makes the Assistant button its switch, and `{"do": "pcm", "on": true}` decodes the
+recordings to PCM as well. A `POST` is taken over the loopback address only, as for
+`/_shutdown`, and `on` is answered with 409 until the controller's link is READY:
+
+```sh
+curl -d '{"do":"on"}' http://127.0.0.1/_mic
+curl -s http://127.0.0.1/_mic | jq '.recording'
+```
 
 ### Waking the controller
 
@@ -242,6 +252,14 @@ Events worth knowing when something does not work:
 | `audio_capture`, `audio_capture_failed`, `audio_capture_ended` | the capture feeding ffmpeg (`system`, `device:`) started, could not start, or stopped (`error` says why); after a failure ffmpeg exits (`audio_ffmpeg_exited`) and both start again, until the stream is stopped |
 | `gamepad_created`, `gamepad_failed` | `--gamepad`: a controller's virtual pad exists (`slot` is its XInput player on Windows; on macOS the driver's feed was started; on Linux `device` is its event device, or its `hidraw` node with `--gamepad uhid`), or could not be created or stopped working (`error`, shown under `gamepads` in `/_status` too); the controller's next boot tries again |
 | `gamepad_rumble_failed` | the game's rumble could not be forwarded (the game session was not up) |
+| `mic_switch` | the controller was asked for its microphone, or told to stop (`on`), by `--mic-capture on` (`reason` is `autostart`), the Assistant button (`ptt`) or `/_mic` (`api`), or told to stop by the receiver as it stops (`stop`) or because sound came unasked (`stray`); without a `ticket` the link was not READY and nothing was sent |
+| `mic_refused` | the controller answered that request with an error (`code`) |
+| `mic_unanswered` | the controller did not answer it within a second, and no sound came; with `again` it was sent once more, four times in all |
+| `mic_recorded` | a recording ended: its `file`, its `seconds`, and under `concealed` the packets that were lost on the way |
+| `mic_recording_failed`, `mic_write_failed` | the run directory refused a recording (`error`); the microphone is switched off |
+| `mic_pcm_unavailable`, `mic_pcm_ended` with a `reason` | `--mic-pcm`: ffmpeg could not be started, or ended before its recording did |
+| `mic_stray` | sound arrived with the switch off, the first packet of it and every 500th; `/_mic` counts all of it under `stray` |
+| `mic_stream_restarted` | a controller's sound went on with sequence numbers behind those it had; the recording goes on with it |
 | `controller_hardware` | one line at READY with what the controller says about itself: product, hardware and firmware builds, serial, headset |
 | `controller_battery` | the battery gauge moved (`percent`); it steps down one percent at a time |
 | `controller_audio_config` | the headset was plugged in or pulled (`headset`) |

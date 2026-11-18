@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from stadiacast import __version__
-from stadiacast.config import AUDIO_APPLICATIONS, PRESETS, Config
+from stadiacast.config import AUDIO_APPLICATIONS, MIC_CAPTURE_MODES, PRESETS, Config
 from stadiacast.errors import SetupError
 from stadiacast.game_session import GAME_FRAMINGS, GAME_KEY_MAX, HAPTICS_WATCHDOG_S
 from stadiacast.helpers import HELPER_FLAG, run_helper
@@ -280,19 +280,15 @@ def build_parser(preset: str | None = None) -> argparse.ArgumentParser:
     g = ap.add_argument_group("controller microphone")
     g.add_argument(
         "--mic-capture",
-        action="store_true",
-        help="ask the pad for its microphone once the link is READY; its Opus stream is written to "
-        "an Ogg file in the run directory (POST /_mic also starts and stops it)",
+        choices=MIC_CAPTURE_MODES,
+        default="off",
+        help="record the controller's microphone to Ogg files in the run directory: on from the moment the "
+        "link is READY, ptt while the Assistant button is held (POST /_mic switches it too)",
     )
     g.add_argument(
         "--mic-pcm",
         action="store_true",
-        help="also decode the microphone to live s16le 48 kHz mono PCM with ffmpeg (a .pcm beside the .ogg)",
-    )
-    g.add_argument(
-        "--mic-ptt",
-        action="store_true",
-        help="hold the Assistant button to capture, release to stop (push to talk)",
+        help="decode each recording with ffmpeg as it arrives, to s16le 48 kHz mono in a .pcm file beside the .ogg",
     )
 
     g = ap.add_argument_group("virtual gamepad")
@@ -493,7 +489,6 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         audio_follow_volume=a.audio_follow_volume == "on",
         mic_capture=a.mic_capture,
         mic_pcm=a.mic_pcm,
-        mic_ptt=a.mic_ptt,
         gamepad=a.gamepad,
         gamepad_deadzone=a.gamepad_deadzone == "on",
         gamepad_profile=a.gamepad_profile,

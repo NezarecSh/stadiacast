@@ -7,12 +7,12 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
-- The controller's own microphone: `--mic-capture` sends `DisplayToController` #5 at READY and
-  records the pad's Opus uplink (RTP PT 111 on the display link) to a playable Ogg file in the
-  run directory. `--mic-pcm` also decodes it to live s16le PCM through ffmpeg, and `--mic-ptt`
-  makes the Assistant button push to talk. `GET /_mic` and `POST /_mic` inspect and control it
-  while the receiver runs; `/_status` reports it under `microphone`. All three are off by
-  default.
+- The controller's microphone, recorded. `--mic-capture on` records it for as long as a
+  controller is connected and `--mic-capture ptt` while its Assistant button is held, into Ogg
+  Opus files in the run directory that a player can open while they are being written.
+  `--mic-pcm` also decodes each recording to raw samples as it arrives, with ffmpeg.
+  `/_status` and `/_input` report the microphone. `/_mic` shows it, and switches it while the
+  receiver runs for requests over the loopback address.
 
 ## [1.2.1] - 2026-11-16
 

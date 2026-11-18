@@ -29,6 +29,7 @@ from google.protobuf import json_format
 from google.protobuf.message import DecodeError
 
 from stadiacast import SERVER_NAME, __version__
+from stadiacast.audio import ffmpeg_path
 from stadiacast.certs import ensure_certificate, resolve_clock_pin
 from stadiacast.config import CLEARCUT_HOSTS, Config
 from stadiacast.controller import ControllerSession
@@ -152,6 +153,8 @@ class Receiver:
     # ---- lifecycle -----------------------------------------------------------------------
     async def start(self) -> None:
         self.events = asyncio.Queue(maxsize=EVENTS_KEPT)
+        if self.cfg.mic_pcm and ffmpeg_path() is None:  # said before anything is made
+            raise SetupError("--mic-pcm decodes the recordings with ffmpeg, and none was found on PATH")
         ensure_certificate(self.cfg, self.log)
         if self.cfg.gamepad != "off" and self.gamepads is None:
             self.gamepads = VirtualGamepads.create(self.cfg, self.log, self)
@@ -220,6 +223,7 @@ class Receiver:
             self._stats_task = None
         for ctl in list(self.controllers.values()):
             ctl.stop()
+        await asyncio.gather(*(ctl.wait_microphone_closed() for ctl in self.controllers.values()))
         if self.gamepads is not None:
             self.gamepads.close()
             await self.gamepads.wait_closed()
@@ -623,39 +627,53 @@ class Receiver:
         return self._json(200, out, handler="audio")
 
     def _mic(self, req: HttpRequest) -> HttpResponse:
-        """``/_mic``: the controller's microphone.
+        """``/_mic``: a controller's microphone.
 
-        ``GET`` reports the state and the capture files, and ignores any body, so a read never
-        opens the microphone.  ``POST`` takes ``{"do": ...}``: ``on`` / ``off`` (the
-        ``DisplayToController`` #5 switch), ``pcm`` (``on``: live PCM decoding) or ``ptt``
-        (``on``: the Assistant button becomes push to talk).
+        ``GET`` shows the switch and the recordings and ignores any body, so a read never opens
+        the microphone.  ``POST`` takes ``{"do": ...}``: ``on`` or ``off`` (the switch), ``pcm``
+        (``on``: whether recordings are decoded to PCM as well) or ``ptt`` (``on``: whether the
+        Assistant button is the switch).  A ``POST`` is taken over the loopback address only: who
+        may make a microphone record is whoever sits at the receiver's computer, or started it
+        with ``--mic-capture``.  ``on`` for a controller whose link is not READY is a 409.
         """
-        body: dict[str, Any] = {}
         if req.method == "GET":
             picked = self._pick(req)
             if isinstance(picked, HttpResponse):
                 return picked
-            return self._json(200, picked.mic_state(), handler="mic")
+            return self._json(200, {**picked.mic_state(), "controller": picked.label}, handler="mic")
         if req.method != "POST":
             return HttpResponse(405, b"", handler="mic")
+        if req.peer is None or not is_loopback(req.peer[0]):
+            return self._json(403, {"error": "only over the loopback address (127.0.0.1)"}, handler="mic")
+        body: dict[str, Any] = {}
         if req.body.strip():
             try:
                 parsed = json.loads(req.body)
                 body = parsed if isinstance(parsed, dict) else {}
-            except ValueError:
+            except (ValueError, RecursionError):  # the second: brackets nested a thousand deep
                 return self._json(400, {"error": "the body is not JSON"}, handler="mic")
         picked = self._pick(req, body)
         if isinstance(picked, HttpResponse):
             return picked
-        action = body.get("do")
+        action, on = body.get("do"), body.get("on", True)
+        if action in ("on", "off") and "on" in body:  # {"do": "on", "on": false} would switch it on
+            return self._json(400, {"error": "do says on or off by itself; on goes with pcm and ptt"}, handler="mic")
+        if action in ("pcm", "ptt") and not isinstance(on, bool):
+            return self._json(400, {"error": "on is true or false"}, handler="mic")
         if action == "on":
             out: dict[str, Any] = picked.mic_start(reason="api")
+            if not out["ok"]:
+                out["error"] = "the display link is not READY: nothing was sent"
         elif action == "off":
             out = picked.mic_stop(reason="api")
+            out["ok"] = True  # off is what it is now, whether the controller could be told or not
         elif action == "pcm":
-            out = picked.set_mic_pcm(bool(body.get("on", True)))
+            try:
+                out = picked.set_mic_pcm(on)
+            except SetupError as e:
+                return self._json(400, {"error": str(e)}, handler="mic")
         elif action == "ptt":
-            out = picked.set_mic_ptt(bool(body.get("on", True)))
+            out = picked.set_mic_ptt(on)
         else:
             return self._json(
                 400,
@@ -663,7 +681,7 @@ class Receiver:
                 handler="mic",
             )
         out["controller"] = picked.label
-        return self._json(200, out, handler="mic")
+        return self._json(409 if "error" in out else 200, out, handler="mic")
 
     def _events(self, req: HttpRequest) -> HttpResponse:
         """``GET /_events``: the live state as server-sent events (:class:`LiveStream`)."""
@@ -939,9 +957,10 @@ class Receiver:
         The short version of ``/_status``, which is everything the receiver knows; ``/_events``
         sends it whenever it changes.  Per controller: ``display_state`` (``ready`` or ``input``
         once the link is up), ``ip``, ``last_seen_s`` (seconds since anything came from it; a
-        connected controller is heard from every 1.5 s), ``battery_percent``, ``headset``, its
-        virtual ``gamepad`` as in ``/_status``, and ``input``: the latest report with the held
-        buttons by name and ``age_s``, or ``None`` when this boot has sent none.
+        connected controller is heard from every 1.5 s), ``battery_percent``, ``headset``,
+        ``microphone`` (whether it was asked for its microphone), its virtual ``gamepad`` as in
+        ``/_status``, and ``input``: the latest report with the held buttons by name and
+        ``age_s``, or ``None`` when this boot has sent none.
         """
         now = time.monotonic()
         pads = self.gamepads.status() if self.gamepads is not None else {}
@@ -968,6 +987,7 @@ class Receiver:
                 "last_seen_s": round(now - ctl.last_seen, 1),
                 "battery_percent": display["battery_percent"],
                 "headset": display["headset"],
+                "microphone": ctl.mic_on,
                 "gamepad": pads.get(ctl.label),
                 "input": report,
             }

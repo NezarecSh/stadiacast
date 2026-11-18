@@ -36,8 +36,8 @@ vibrates on request and plays sound on its headset jack.
   controller for Mac games, rumble included.
 - 🎧 **Headset audio.** What the PC plays, or any file, streams to a headset plugged into the
   controller.
-- 🎤 **The controller's microphone.** One RPC switches on the pad's own mic; its Opus stream
-  is recorded to a playable Ogg file, with optional live PCM for forwarding.
+- 🎤 **The controller's microphone.** Recorded on your PC, all the time or while you hold the
+  Assistant button.
 - 👥 **Several controllers at once**, each one its own player.
 
 <p align="center">
@@ -121,9 +121,8 @@ stadiacast --preset live --dns-upstream 192.168.1.1   # your router: the DNS sin
 - Nothing else for the basics: the receiver ships a certificate the controller accepts
   ([serving your own](docs/setup.md#certificate) is optional), and the executables include
   Python. An install from PyPI or from source needs Python 3.11 or newer.
-- Optional: ffmpeg for [headset audio](#headset-audio) and for live PCM from the
-  [controller's microphone](#controller-microphone) (the Ogg recording itself needs nothing),
-  a driver for the virtual gamepad on
+- Optional: ffmpeg for [headset audio](#headset-audio) and for the samples of the
+  [controller's microphone](#controller-microphone), a driver for the virtual gamepad on
   [Windows](#virtual-gamepad-windows) and on [macOS](#virtual-gamepad-macos) (the one on
   [Linux](#virtual-gamepad-linux) needs none), `tcpdump` for packet captures.
 
@@ -196,25 +195,28 @@ install libportaudio2`). How the stream rides the display link is in
 
 ## Controller microphone
 
-The controller has a microphone of its own (the one the Assistant button used). It is not part
-of party chat: one `DisplayToController` #5 request switches it on, and the pad then sends Opus
-on the display link's audio m-line. The receiver writes those packets to an Ogg file in the run
-directory, playable while it is still being recorded:
+The receiver can record a controller's microphone into the run directory:
 
 ```sh
-stadiacast --mic-capture                    # ask for the mic at READY, record to mic_<c0>_<time>.ogg
-stadiacast --mic-capture --mic-pcm          # also write live s16le 48 kHz mono PCM to a .pcm file
-stadiacast --mic-capture --mic-ptt          # hold the Assistant button to record, release to stop
+stadiacast --mic-capture on             # for as long as the controller is connected
+stadiacast --mic-capture ptt            # while its Assistant button is held
+stadiacast --mic-capture ptt --mic-pcm  # the samples as well, decoded by ffmpeg
 ```
 
-`POST /_mic` with `{"do":"on"}` / `{"do":"off"}` starts and stops it, `{"do":"pcm","on":true}`
-and `{"do":"ptt","on":true}` toggle the other two, and `GET /_mic` (also `/_status` under
-`microphone`) reports the file, the packet count and the PCM level. `--mic-pcm` needs ffmpeg on
-`PATH`; without it the Ogg capture still works. Everything is off by default.
+A recording is an Ogg Opus file, `mic_c0_184930.ogg` for the first controller at 18:49:30, and
+a player can open it while it is still being written. With `ptt` every hold of the button is a
+file of its own. `--mic-pcm` also decodes each recording as it arrives, into a `.pcm` file of
+the same name: signed 16-bit little-endian samples, 48 kHz, mono, 96 kB for every second. It is
+a recording and not a microphone of the computer: a program that wants the sound reads one of
+the two files while it grows. Nothing deletes the recordings.
 
-The stream is about 64 kbit/s with no DTX: a quiet room is full-rate encoded silence, not a
-broken decoder. [docs/protocol.md](docs/protocol.md#the-controllers-microphone) has the wire
-details, including why the answer has to name an audio codec even when the offer does not.
+The controller's light blinks while its microphone is on. With a headset plugged into the
+controller, the headset's microphone is the one recorded. The microphone takes a moment to
+start: with `ptt`, speak once the light blinks, and a press shorter than that records nothing.
+
+`/_status` reports the microphone under `microphone`, and `/_mic` shows it and switches it
+while the receiver runs ([docs/setup.md](docs/setup.md#running)). How the controller sends its
+sound is in [docs/protocol.md](docs/protocol.md#the-controllers-microphone).
 
 ## Virtual gamepad (Windows)
 

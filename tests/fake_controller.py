@@ -68,6 +68,12 @@ OMAHA_REQUEST = (
 )
 
 AUDIO_MODE_WEBRTC_OPUS = 2  # the SetAudioModeRequest mode whose route reaches the headset jack
+#: A packet as the microphone's encoder makes most of them: the first byte of 20 ms of mono
+#: CELT at full band, and 160 bytes that stand for the sound (a real one has more or fewer
+#: while the sound changes, and is ``f8 ff fe`` for a frame of digital silence).
+MIC_FRAME = b"\xf8" + b"\x41" * 160
+#: The SSRC the lab controller's offers name for audio, which is its microphone's.
+MIC_SSRC = 1111
 
 
 class FakeController:
@@ -147,10 +153,13 @@ class FakeController:
         self.audio_unplayed = 0
         self.audio_payload_type = 111
         self.audio_route_open = False  # SetAudioModeRequest mode 2 was accepted in this boot
-        # The pad's own microphone: DisplayToController #5 (BoolValue) turns its Opus uplink on
-        # and off.  mic_frames are sent on the display link's audio m-line (RTP PT 111).
-        self.mic_requests: list[bool] = []
-        self.mic_capture = False
+        # The microphone: DisplayToController.set_microphone switches it, and send_mic_frame()
+        # is one packet of what the firmware then sends.
+        self.mic_requests: list[bool] = []  # every set_microphone value received
+        self.mic_on = False
+        self.mic_refuse = 0  # answer the next set_microphone true with this error code, once
+        self.mic_lose_requests = 0  # so many of the next requests are lost on their way: not heard, not answered
+        self.mic_lose_answers = 0  # so many of the next are heard, and their answers lost
         self._mic_seq = 0
         self._mic_ts = 0x1000
         self.headset_plugged = False  # GetControllerStateResponse.f4
@@ -285,7 +294,7 @@ class FakeController:
             elif msg.HasField("set_audio_mode") and msg.set_audio_mode.mode == AUDIO_MODE_WEBRTC_OPUS:
                 self._on_set_audio_mode(rpc["ticket"])
             elif msg.HasField("set_microphone"):
-                self._on_mic_capture(rpc["ticket"], msg.set_microphone.value)
+                self._on_set_microphone(rpc["ticket"], msg.set_microphone.value)
             else:
                 self.endpoint.send_wire(
                     WIRE_ID_DC_RPC_CONTROLLER,
@@ -316,20 +325,47 @@ class FakeController:
             response = p.rpc_response(ticket)
         self.endpoint.send_wire(WIRE_ID_DC_RPC_CONTROLLER, response)
 
-    def _on_mic_capture(self, ticket: int, on: bool) -> None:
-        """DisplayToController #5: the firmware opens or stops its microphone encoder."""
+    def _on_set_microphone(self, ticket: int, on: bool) -> None:
+        """DisplayToController.set_microphone: an empty response, and the microphone is on or
+        off; ``mic_refuse`` answers one true with that error instead. The request is one datagram
+        and so is its answer: ``mic_lose_requests`` and ``mic_lose_answers`` lose the next ones."""
+        if self.mic_lose_requests:
+            self.mic_lose_requests -= 1
+            return
         self.mic_requests.append(on)
-        self.mic_capture = on
-        self.endpoint.send_wire(WIRE_ID_DC_RPC_CONTROLLER, self.protos.rpc_response(ticket))
+        if on and self.mic_refuse:
+            response = self.protos.rpc_response(ticket, code=self.mic_refuse, message="refused by the lab controller")
+            self.mic_refuse = 0
+        else:
+            self.mic_on = on
+            response = self.protos.rpc_response(ticket)
+        if self.mic_lose_answers:
+            self.mic_lose_answers -= 1
+            return
+        self.endpoint.send_wire(WIRE_ID_DC_RPC_CONTROLLER, response)
 
-    def send_mic_frame(self, payload: bytes | None = None, timestamp: int | None = None) -> bool:
-        """One 20 ms Opus packet from the pad's microphone, on the display link (raw_dtls)."""
-        self._mic_seq = (self._mic_seq + 1) & 0xFFFF
+    def send_mic_frame(
+        self,
+        payload: bytes | None = None,
+        timestamp: int | None = None,
+        *,
+        seq: int | None = None,
+        even_if_off: bool = False,
+    ) -> bool:
+        """One packet of the microphone as the firmware sends it: 20 ms of Opus in RTP with
+        payload type 111, header extension 6 holding ``ff``, the SSRC the offer names for audio
+        and a sequence of the stream's own, as SRTP on the media pair (never inside DTLS,
+        whatever the offer says about ``raw_dtls``). A microphone that is off sends nothing,
+        unless the test wants the packet that was still on its way (``even_if_off``);
+        ``timestamp`` and ``seq`` let a test lose, repeat or swap packets."""
+        if not (self.mic_on or even_if_off):
+            return False
+        self._mic_seq = ((self._mic_seq + 1) if seq is None else seq) & 0xFFFF
         ts = self._mic_ts if timestamp is None else timestamp
         self._mic_ts = (ts + 960) & 0xFFFFFFFF
-        frame = payload if payload is not None else b"\xf8" + b"\x41" * 159
-        packet = build_rtp(111, self._mic_seq, ts, 0x049A6E9C, frame)
-        return self.endpoint.send_wire(WIRE_ID_RTP, packet)
+        frame = payload if payload is not None else MIC_FRAME
+        packet = build_rtp(111, self._mic_seq, ts, MIC_SSRC, frame, False, [(6, b"\xff")])
+        return self.endpoint.send_rtp_packet(packet)
 
     def _on_start_game(self, ticket: int, req) -> None:
         """StartGame in READY: the app moves from BROWSE to STARTING_GAME and holds the reply
@@ -916,7 +952,7 @@ class FakeController:
         o.rtc_session_version = "2"
         o.ice_ufrag, o.ice_password, o.fingerprint = params["ice_ufrag"], params["ice_password"], params["fingerprint"]
         o.cname = "fakecname"
-        o.audio_ssrc, o.video_ssrc = 1111, 2222
+        o.audio_ssrc, o.video_ssrc = MIC_SSRC, 2222
         o.boreal_available = True
         o.boreal_supported_transports.append(p.enum(f"{PKG_API}.BorealTransportProtocol", "BOREAL_SRTP"))
         vf = o.video_format.add()

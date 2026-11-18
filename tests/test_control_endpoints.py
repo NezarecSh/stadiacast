@@ -127,7 +127,7 @@ def test_the_control_endpoints_take_no_requests_from_web_pages(tmp_path):
         port = rx.http.http_ports[0]
         page = [("Origin", "http://example.com")]
         try:
-            for path in ("/_rumble", "/_start_game", "/_audio"):
+            for path in ("/_rumble", "/_start_game", "/_audio", "/_mic"):
                 st, _, body = await fc.request("POST", "x.local", path, b"{}", "text/plain", page, port=port, tls=False)
                 assert st == 403 and b"web pages" in body
                 st, _, _ = await fc.request("POST", "x.local", path, b"{}", "text/plain", port=port, tls=False)

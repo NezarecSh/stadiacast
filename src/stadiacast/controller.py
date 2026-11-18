@@ -10,17 +10,18 @@ listeners, the helper processes and the log.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from typing import TYPE_CHECKING, Any
 
 from google.protobuf.message import DecodeError
 
 from stadiacast import SERVER_NAME, signaling
-from stadiacast.audio import AudioSender, Source, source_from_spec
+from stadiacast.audio import AudioSender, Source, ffmpeg_path, source_from_spec
 from stadiacast.config import AUDIO_APPLICATIONS
 from stadiacast.errors import SetupError
 from stadiacast.game_session import GameSession
-from stadiacast.gamepad import GamepadState
+from stadiacast.gamepad import Button, GamepadState
 from stadiacast.http_server import HttpResponse
 from stadiacast.input_protocol import InputDecoder
 from stadiacast.microphone import MIC_PAYLOAD_TYPE, MicrophoneCapture, capture_path
@@ -41,6 +42,11 @@ if TYPE_CHECKING:
 
 #: Milestones of the post-DTLS phase, in order.  The display state never moves backwards.
 DISPLAY_STATES = ("idle", "dtls-connected", "get-controller-state-sent", "controller-state-received", "ready", "input")
+#: How long the controller has to answer ``set_microphone`` before it is asked again: its own
+#: microphone takes a third of a second to start, and the answer comes with it.
+MIC_ANSWER_TIMEOUT = 1.0
+#: How often one request is sent in all, and how often a controller that sends unasked is told to stop.
+MIC_TRIES = 4
 
 #: Placeholder identity of this display in the discovery responses (the firmware only checks presence).
 DISPLAY_ID = SERVER_NAME
@@ -128,9 +134,6 @@ class ControllerSession:
             "input_series": 0,
             "last_ack": None,
             "input_payload_type": None,
-            "mic_packets": 0,
-            "mic_bytes": 0,
-            "mic_file": None,
             "registered": None,
             "discovery": None,
             "gmsg": {"pending_id": None, "sent": 0, "acked": 0, "polls": 0, "last_ack": None},
@@ -157,13 +160,25 @@ class ControllerSession:
         self._audio_volume = _clamp_volume(self.cfg.audio_volume)
         self._audio_application = self.cfg.audio_application
         self._audio_task: asyncio.Task[None] | None = None  # this boot's --audio-source autostart
-        #: One recording of the pad's microphone, created on its first Opus packet.
-        self._mic: MicrophoneCapture | None = None
-        self._mic_last: dict[str, Any] | None = None  # the finished capture, so /_mic still finds it
-        self.mic_on = False  # DisplayToController #5 was last sent true
-        self.mic_ptt = bool(self.cfg.mic_ptt)  # Assistant button = push to talk
-        self.mic_pcm = bool(self.cfg.mic_pcm)  # live PCM alongside the Ogg capture
-        self._mic_autostarted = False  # --mic-capture fires once per boot
+        #: The controller's microphone. ``mic_on`` is the switch as the receiver wants it and has
+        #: told the controller; a recording is opened by the first packet that follows and closed
+        #: with the switch.
+        self.mic_on = False
+        self.mic_ptt = self.cfg.mic_capture == "ptt"  # the Assistant button holds the switch
+        self.mic_pcm = self.cfg.mic_pcm  # the next recording gets a PCM file as well
+        self._mic: MicrophoneCapture | None = None  # the recording that is open
+        self._mic_done: MicrophoneCapture | None = None  # the one before it, which /_mic still names
+        self._mic_ending: list[MicrophoneCapture] = []  # closed, their decoders seeing the rest through
+        self._mic_ticket: int | None = None  # the request that turned it on, whose answer may refuse
+        self._mic_asked: tuple[int, bool, int] | None = None  # the request not answered yet: ticket, on, tries
+        self._mic_watch: asyncio.TimerHandle | None = None  # asks again when no answer comes
+        self._mic_told = float("-inf")  # when a request last went out (monotonic)
+        self._mic_held = False  # the switch is on because the Assistant button is held
+        self._mic_button = False  # the Assistant button as the last report had it
+        self._mic_autostarted = False  # --mic-capture on asks once per boot
+        self._mic_stray = 0  # packets that came with the switch off
+        self._mic_strays = 0  # those since the switch was last thrown
+        self._mic_hushed = 0  # times a controller that sent them was told to stop, since then
 
     def __repr__(self) -> str:
         return f"ControllerSession({self.label}, key={self.key!r}, ip={self.ip!r})"
@@ -202,6 +217,9 @@ class ControllerSession:
                 task.cancel()
         self._rtcp_task = self._display_task = self._display_fallback_task = None
         self._stop_audio()
+        if self.mic_on:  # a controller left with its microphone on would go on sending to nobody
+            self.mic_stop(reason="stop")
+        self._forget_asked()  # the link ends here: nobody is left to wait for that answer
         self._close_mic()
         if self.rx.gamepads is not None:
             self.rx.gamepads.release(self.label)
@@ -221,6 +239,7 @@ class ControllerSession:
         immediately) and the display RPC trigger never fires.  The same reset runs when the
         controller closes the link (:meth:`_on_rtc_state`).
         """
+        self._reset_microphone()  # before the way out below, which only knows the link's own state
         if self._dtls_at is None and self._resolved_at is None and self._display_task is None:
             return
         for name in ("_rtcp_task", "_display_task", "_display_fallback_task"):
@@ -242,9 +261,6 @@ class ControllerSession:
         self.latest_input = None  # nothing it held is held any more
         self.session["display"] = _fresh_display_session()
         self._stop_audio()
-        self._close_mic()
-        self._mic_autostarted = False
-        self.mic_on = False
         if self.rx.gamepads is not None:
             self.rx.gamepads.release(self.label)
         self.game.reset()
@@ -424,96 +440,226 @@ class ControllerSession:
         if sender is not None:
             sender.kill_now()
 
-    # ---- controller microphone ---------------------------------------------------
+    # ---- the controller's microphone -----------------------------------------------------
     def mic_start(self, *, reason: str = "api") -> dict[str, Any]:
-        """Ask the pad to send its microphone: ``DisplayToController`` #5 (BoolValue) = true.
+        """Ask the controller for its microphone: ``DisplayToController.set_microphone`` true.
 
-        Confirmed on hardware: Opus starts on the display session's audio m-line within a frame
-        or two, at one packet per 20 ms.  Nothing in the SDP or in the empty OK reply says so,
-        which is why a receiver that never sends this request looks like it has a broken decoder.
-        No party chat, no SCTP, no second session is involved.
+        It answers with an empty response and sends Opus on the display link from then on, one
+        packet per 20 ms (``docs/protocol.md``); the first packet opens the recording. The request
+        only goes to a link that is READY, where the controller takes requests: before that
+        nothing is sent, nothing changes, and the result says so.
         """
-        p = self.protos
-        msg = p.DisplayToController()
-        msg.set_microphone.value = True
-        ticket = self.send_rpc("request", msg, purpose="mic_capture")
-        self.mic_on = True
-        self.log("mic_capture", on=True, reason=reason, ticket=ticket)
-        return {"ok": ticket is not None, "on": True, "ticket": ticket}
+        return self._set_microphone(True, reason)
 
     def mic_stop(self, *, reason: str = "api") -> dict[str, Any]:
-        """#5 = false stops the stream; the open capture is finalised with an Ogg EOS page."""
-        p = self.protos
-        msg = p.DisplayToController()
-        msg.set_microphone.value = False
-        ticket = self.send_rpc("request", msg, purpose="mic_capture")
-        self.mic_on = False
+        """``set_microphone`` false, and the end of the recording that is open."""
+        out = self._set_microphone(False, reason)
         self._close_mic()
-        self.log("mic_capture", on=False, reason=reason, ticket=ticket)
-        return {"ok": ticket is not None, "on": False, "ticket": ticket}
+        return out
+
+    def _link_ready(self) -> bool:
+        return DISPLAY_STATES.index(self.display_state) >= DISPLAY_STATES.index("ready")
+
+    def _set_microphone(self, on: bool, reason: str) -> dict[str, Any]:
+        ticket = self._ask_microphone(on) if self._link_ready() else None
+        if ticket is not None or not on:  # a controller that cannot be told has its microphone off
+            changed, self.mic_on = self.mic_on != on, on
+            self._mic_ticket = ticket if on else None
+            self._mic_held = on and reason == "ptt"
+            self._mic_strays = self._mic_hushed = 0
+            if changed:
+                self.rx.live_changed()
+        self.log("mic_switch", on=on, reason=reason, ticket=ticket)
+        return {"ok": ticket is not None, "on": self.mic_on, "ticket": ticket}
+
+    def _ask_microphone(self, on: bool, tries: int = 1) -> int | None:
+        """One ``set_microphone`` request, and a watch on its answer. The request is a single
+        datagram: lost, it would leave a controller sending for a receiver that thinks it silent,
+        or silent for one that waits for it."""
+        msg = self.protos.DisplayToController()
+        msg.set_microphone.value = on
+        ticket = self.send_rpc("request", msg, purpose="microphone_on" if on else "microphone_off")
+        self._forget_asked()
+        if ticket is not None:
+            self._mic_asked = (ticket, on, tries)
+            self._mic_told = time.monotonic()
+            with contextlib.suppress(RuntimeError):  # no loop runs: nothing is left that could ask again
+                self._mic_watch = asyncio.get_running_loop().call_later(
+                    MIC_ANSWER_TIMEOUT, self._on_microphone_unanswered, ticket
+                )
+        return ticket
+
+    def _forget_asked(self) -> None:
+        if self._mic_watch is not None:
+            self._mic_watch.cancel()
+        self._mic_watch = self._mic_asked = None
+
+    def _on_microphone_answer(self, ticket: int, on: bool, code: int, message: str | None) -> None:
+        """The controller's response to a ``set_microphone`` request: nothing waits for it any
+        more, and an error in answer to true is a refusal."""
+        if self._mic_asked is not None and self._mic_asked[0] == ticket:
+            self._forget_asked()
+        if on and code:
+            self._on_microphone_refused(ticket, code, message)
+
+    def _on_microphone_unanswered(self, ticket: int) -> None:
+        """No answer in :data:`MIC_ANSWER_TIMEOUT`, and for true no sound either: the request is
+        sent again, :data:`MIC_TRIES` times in all. A controller that still says nothing to true
+        is taken to be silent, and the switch is off again."""
+        self._mic_watch = None
+        if self._mic_asked is None or self._mic_asked[0] != ticket:
+            return
+        _, on, tries = self._mic_asked
+        again = self._ask_microphone(on, tries + 1) if tries < MIC_TRIES and self._link_ready() else None
+        self.log("mic_unanswered", on=on, ticket=ticket, tries=tries, again=again)
+        if again is not None:
+            if on:
+                self._mic_ticket = again
+            return
+        self._forget_asked()
+        if on:
+            self.mic_on = self._mic_held = False
+            self._mic_ticket = None
+            self._close_mic()
+            self.rx.live_changed()
+
+    def _reset_microphone(self) -> None:
+        """A controller that boots, or whose link has ended, has its microphone off."""
+        self._close_mic()
+        self._forget_asked()
+        self._mic_autostarted = self._mic_held = self._mic_button = False
+        self._mic_ticket = None
+        self._mic_told = float("-inf")
+        self._mic_strays = self._mic_hushed = 0
+        if self.mic_on:
+            self.mic_on = False
+            self.rx.live_changed()
+
+    def _on_microphone_refused(self, ticket: int, code: int, message: str | None) -> None:
+        """The controller answered ``set_microphone`` true with an error: the switch is off,
+        unless it has been thrown again since, and that request's answer decides."""
+        stale = ticket != self._mic_ticket
+        self.log("mic_refused", ticket=ticket, code=code, error_message=message, stale=stale)
+        if stale:
+            return
+        self.mic_on = self._mic_held = False
+        self._mic_ticket = None
+        self._close_mic()
+        self.rx.live_changed()
 
     def set_mic_pcm(self, on: bool) -> dict[str, Any]:
-        """Turn live PCM decoding on or off; a running capture is closed so both files line up."""
-        self._close_mic()
-        self.mic_pcm = bool(on)
-        self.log("mic_pcm_toggle", on=self.mic_pcm)
+        """Decode the recordings to PCM as well, or stop doing so. A change closes the open
+        recording: the next packet starts one whose two files cover the same sound. Without
+        ffmpeg it is a :class:`~stadiacast.errors.SetupError`."""
+        if on and ffmpeg_path() is None:
+            raise SetupError("the PCM file is decoded by ffmpeg, and none was found on PATH")
+        if on != self.mic_pcm:
+            self._close_mic()
+            self.mic_pcm = on
+            self.log("mic_pcm", on=on)
         return {"ok": True, "pcm": self.mic_pcm}
 
     def set_mic_ptt(self, on: bool) -> dict[str, Any]:
-        """Arm (or disarm) push-to-talk on the Assistant button."""
-        self.mic_ptt = bool(on)
-        self.log("mic_ptt_toggle", on=self.mic_ptt)
+        """Make the Assistant button the microphone's switch, or stop it being one."""
+        if on != self.mic_ptt:
+            self.mic_ptt = on
+            self.log("mic_ptt", on=on)
+        if not on and self._mic_held:  # nothing would let go of it any more
+            self.mic_stop(reason="ptt")
         return {"ok": True, "ptt": self.mic_ptt}
 
     def mic_state(self) -> dict[str, Any]:
-        """What ``/_mic`` and ``/_status`` report about the microphone."""
-        idle: dict[str, Any] = {"packets": 0, "bytes": 0, "file": None, "pcm_file": None, "pcm": None}
-        state = self._mic.state() if self._mic is not None else (self._mic_last or idle)
-        return {"on": self.mic_on, "ptt": self.mic_ptt, "pcm": self.mic_pcm, "controller": self.label, **state}
+        """What ``/_mic`` and ``/_status`` say: the switch, the two settings, the recording that
+        is open and the one that ended last."""
+        return {
+            "on": self.mic_on,
+            "ptt": self.mic_ptt,
+            "pcm": self.mic_pcm,
+            "recording": None if self._mic is None else self._mic.state(),
+            "last": None if self._mic_done is None else self._mic_done.state(),
+            "stray": self._mic_stray,
+        }
 
-    def _on_mic_packet(self, pkt: RtpPacket) -> None:
-        """One Opus packet from the pad's microphone (PT 111 on the display m-line)."""
+    def _on_mic_packet(self, pkt: RtpPacket, via: str) -> None:
+        """One Opus packet of the microphone."""
+        if not self.mic_on:
+            self._on_stray_packet(pkt, via)
+            return
+        if self._mic_asked is not None and self._mic_asked[1]:
+            self._forget_asked()  # the sound is the answer, should the OK have been lost
         if self._mic is None:
-            if not self.mic_on:
-                # A frame already queued when #5 went false: opening a file for it would leave
-                # an empty capture behind, and a second handle on the same directory entry.
-                return
+            assert self.cfg.log_dir is not None
             path = capture_path(self.cfg.log_dir, self.label)
             try:
                 self._mic = MicrophoneCapture(path, pcm=self.mic_pcm, log=self.log)
             except OSError as e:
-                self.log("mic_open_failed", error=str(e), path=path)
+                self.log("mic_recording_failed", file=path, error=str(e))
+                self.mic_stop(reason="no file")
                 return
-        self._mic.write(pkt.payload, pkt.timestamp)
-        self.session["mic_packets"] = self._mic.packets
-        self.session["mic_bytes"] = self._mic.bytes
-        self.session["mic_file"] = self._mic.path
-        if self._mic.packets <= 3 or self._mic.packets % 500 == 0:
-            self.log("mic_rtp", n=self._mic.packets, seq=pkt.seq, ts=pkt.timestamp, bytes=len(pkt.payload))
+        before = self._mic.packets
+        try:
+            self._mic.write(pkt.payload, pkt.timestamp, pkt.seq)
+        except OSError as e:  # a full disk ends the recording, not the link
+            self.log("mic_write_failed", file=self._mic.path, error=str(e))
+            self.mic_stop(reason="write failed")
+            return
+        n = self._mic.packets
+        if n != before and (n <= 3 or n % 500 == 0):  # the first packets of a recording, then one in ten seconds
+            self.log("mic_rtp", _quiet=n > 3, n=n, via=via, **pkt.summary())
+
+    def _on_stray_packet(self, pkt: RtpPacket, via: str) -> None:
+        """Sound with the switch off: still on its way when the switch went off, or sent by a
+        controller that did not hear it go off. There is no file for it. When no request is
+        under way that would end it, the controller is told to stop, a few times at most."""
+        self._mic_stray += 1
+        self._mic_strays += 1
+        if self._mic_strays == 1 or self._mic_strays % 500 == 0:
+            self.log("mic_stray", _quiet=self._mic_strays > 1, n=self._mic_strays, via=via, **pkt.summary())
+        if (
+            self._mic_asked is None
+            and self._mic_hushed < MIC_TRIES
+            and self._link_ready()
+            and time.monotonic() - self._mic_told >= MIC_ANSWER_TIMEOUT
+        ):
+            self._mic_hushed += 1
+            self.log("mic_switch", on=False, reason="stray", ticket=self._ask_microphone(False))
 
     def _close_mic(self) -> None:
         capture, self._mic = self._mic, None
-        if capture is not None:
-            self._mic_last = capture.state()  # keep the file name after the EOS page is written
-            capture.close()
+        if capture is None:
+            return
+        capture.close()
+        self._mic_done = capture
+        self._mic_ending = [c for c in self._mic_ending if not c.ended] + [capture]
+
+    async def wait_microphone_closed(self) -> None:
+        """After :meth:`stop`: wait until no recording has a decoder running any more."""
+        ending, self._mic_ending = self._mic_ending, []
+        for capture in ending:
+            await asyncio.to_thread(capture.join)
 
     def _maybe_start_mic(self) -> None:
-        """``--mic-capture``: ask for the microphone once per boot, when the link reaches READY."""
-        if not self.cfg.mic_capture or self._mic_autostarted or self.mic_on:
+        """``--mic-capture on``: ask for the microphone once per boot, when the link is READY."""
+        if self.cfg.mic_capture != "on" or self._mic_autostarted or self.mic_on:
             return
         self._mic_autostarted = True
         self.mic_start(reason="autostart")
 
-    def _maybe_push_to_talk(self, ev: dict[str, Any]) -> None:
-        """Assistant held = capture, released = stop.  The pad only reports that button on the
-        display link, so an input report is the one place a physical key can drive #5."""
+    def _push_to_talk(self, state: GamepadState) -> None:
+        """The Assistant button as the switch: pressing it turns the microphone on, letting go
+        turns it off. A microphone that was on already is not this button's to turn off, and one
+        that was turned off during the hold stays off until the next press.
+
+        Only the display link's own reports come here (``ControllerToDisplay`` #3), whose buttons
+        are mapped. The input protocol's reports, a game session's among them, have a layout
+        nobody has mapped: a microphone is not switched on a guess."""
+        held = bool(state.buttons & Button.ASSISTANT)
+        pressed, self._mic_button = held and not self._mic_button, held
         if not self.mic_ptt:
             return
-        pressed = ev.get("pressed_names") or []
-        released = ev.get("released_names") or []
-        if "assistant" in pressed and not self.mic_on:
+        if pressed and not self.mic_on:
             self.mic_start(reason="ptt")
-        elif "assistant" in released and self.mic_on:
+        elif not held and self._mic_held:
             self.mic_stop(reason="ptt")
 
     # ---- discovery RPCs ------------------------------------------------------------------
@@ -810,16 +956,14 @@ class ControllerSession:
             pass
 
     def _on_rtp(self, pkt: RtpPacket, via: str = "srtp") -> None:
-        """Input RTP, either SRTP on the UDP wire or (raw_dtls) a plain RTP packet on WireHeader2
-        sub-channel 0x66; the ack goes back the same way."""
+        """RTP from the controller: the microphone's Opus, which comes as SRTP on the UDP wire, or
+        input, which comes that way or (raw_dtls) as a plain RTP packet on WireHeader2 sub-channel
+        0x66 and whose ack goes back the way it came."""
         self.seen()
-        self.session["input_payload_type"] = pkt.payload_type
-        # The pad's microphone shares the audio m-line with the headset downlink (Opus, PT 111,
-        # one packet per 20 ms).  It is not the input protocol: feeding it to InputDecoder is
-        # why every frame used to be logged as undecodable and thrown away.
-        if pkt.payload_type == MIC_PAYLOAD_TYPE:
-            self._on_mic_packet(pkt)
+        if pkt.payload_type == MIC_PAYLOAD_TYPE:  # Opus from the microphone, not the input protocol
+            self._on_mic_packet(pkt, via)
             return
+        self.session["input_payload_type"] = pkt.payload_type
         try:
             decoded = self.input.decode(pkt.payload)
         except (DecodeError, ValueError) as e:
@@ -1072,6 +1216,10 @@ class ControllerSession:
             self._on_audio_config(msg.audio_configuration_changed)
         elif kind == "response" and rec.get("purpose") == "start_game":
             self.game.on_start_game_response(ticket, rpc)
+        elif kind == "response" and rec.get("purpose") in ("microphone_on", "microphone_off"):
+            self._on_microphone_answer(
+                ticket, rec["purpose"] == "microphone_on", int(rpc.get("code") or 0), rpc.get("error_message") or None
+            )
         elif kind == "response" and rec.get("purpose") == "get_controller_state":
             if rpc.get("code") or variant != "controller_state":
                 # e.g. 13 INTERNAL from the responder destructor (request in R/C/WAITING_ACCEPT_COMMAND)
@@ -1111,6 +1259,7 @@ class ControllerSession:
         self._last_input = state
         self._set_display_state("input", via="rpc")
         self.emit_input_event(ev)
+        self._push_to_talk(state)
 
     # ---- what the controller reports about itself ----------------------------------
     def _log_hardware_summary(self) -> None:
@@ -1215,7 +1364,7 @@ class ControllerSession:
         ev["controller"] = self.label
         self.log("input", **ev)
         if "axes" in ev:  # a gamepad report; the game session's other events carry none
-            self.latest_input = (GamepadState.from_event(ev), time.monotonic())
+            state = GamepadState.from_event(ev)
+            self.latest_input = (state, time.monotonic())
             self.rx.live_changed()
         self.rx.publish_event(ev)
-        self._maybe_push_to_talk(ev)

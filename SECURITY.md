@@ -16,22 +16,26 @@ anywhere else:
 - **Controllers are not authenticated.** Any device on the network that speaks the protocol is
   taken for a controller, and can take the place of one that is connected.
 - **The control endpoints have no login.** `/_status`, `/_input`, `/_events`, `/_rumble`,
-  `/_start_game` and `/_audio` answer on every listener (443, 80 and 8008) to anyone who can
-  reach it. `/_status` shows each controller's serial number, device ids, address and session
-  state, the credentials of its WebRTC sessions included, and the run directory. `/_input` and
-  `/_events` show what is pressed on each controller as it happens. `/_rumble` and
-  `/_start_game` act on a controller. `/_audio` starts and stops the stream to a controller's
-  headset from a sound file of this computer, from what the computer plays or from one of its
-  capture devices, a microphone included. `/_shutdown` stops the receiver and is taken over the
-  loopback address only. What a browser sends on behalf of a web page is refused (any request
-  other than `GET` that carries an `Origin` header).
+  `/_start_game`, `/_audio` and `/_mic` answer on every listener (443, 80 and 8008) to anyone
+  who can reach it. `/_status` shows each controller's serial number, device ids, address and
+  session state, the credentials of its WebRTC sessions included, and the run directory.
+  `/_input` and `/_events` show what is pressed on each controller as it happens. `/_rumble`
+  and `/_start_game` act on a controller. `/_audio` starts and stops the stream to a
+  controller's headset from a sound file of this computer, from what the computer plays or from
+  one of its capture devices, a microphone included. `/_mic` shows whether a controller's
+  microphone is being recorded, into which file and, with `--mic-pcm`, how loud the sound is;
+  switching it is taken over the loopback address only, so a controller's microphone records
+  when the receiver was started with `--mic-capture` or its own computer asks. `/_shutdown` stops the receiver and is taken over
+  the loopback address only as well. What a browser sends on behalf of a web page is refused
+  (any request other than `GET` that carries an `Origin` header).
 - **It impersonates Google hostnames** for the clients that resolve names through its DNS sink,
   and the sink answers whoever asks it. Only point the devices at it that you want to talk to
   the receiver; names it does not redirect are forwarded to your resolver unchanged.
 - **The run directory is private data.** `captures/<stamp>/` holds every request body the
   controller sent and a log with its serial number, device ids, addresses and the certificates
-  and tokens it presents, and `dns.jsonl` lists every name looked up through the sink. Captures
-  are ignored by git; cut them down before you share one.
+  and tokens it presents, and `dns.jsonl` lists every name looked up through the sink. With
+  `--mic-capture` it also holds what the controllers' microphones heard. Captures are ignored
+  by git; cut them down before you share one.
 - **The built-in certificate proves nothing.** Its private key ships with the package, so TLS
   on this server satisfies the controller's check and protects no one. A certificate of your
   own under `certs/` is different: its key is a real key for a domain you own. Keep it

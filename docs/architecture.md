@@ -46,7 +46,8 @@ Receiver                                   one per process (receiver.py)
       ├── InputDecoder                     InputProtocolMessage stream (input_protocol.py)
       ├── AudioSender                      Opus to the headset jack, paced RTP on the media pair (audio.py)
       │    └── BlockCapture                PCM for system / device:NAME (capture.py; loopback.py on Windows)
-      ├── MicrophoneCapture               Opus from the pad's mic into Ogg + optional live PCM (microphone.py)
+      ├── MicrophoneCapture                the microphone's Opus into an Ogg file (microphone.py)
+      │    └── PcmDecoder                  --mic-pcm: ffmpeg decoding the same stream to PCM
       └── GameSession                      StartGame, proxied RPCs, rumble (game_session.py)
            ├── RtcEndpoint "game"          second UDP socket, own certificate
            └── InputDecoder
@@ -82,13 +83,6 @@ lives while it plays. ffmpeg is only the convenient encoder: a front end with it
 and encoder starts the pacer alone with `audio_start(None)` and hands it Opus frames through
 `audio_feed()`.
 
-The same session owns the *other* direction of that m-line when `--mic-capture`, `/_mic` or
-`--mic-ptt` asks for it: `DisplayToController` #5 switches the pad's encoder on, RTP PT 111 is
-routed away from `InputDecoder` into a `MicrophoneCapture` (`microphone.py`), which streams the
-Opus packets into an unbuffered Ogg file and, optionally, through one long-lived ffmpeg into
-live s16le PCM. The decoder is fed from a bounded queue on a writer thread, so a slow consumer
-drops Ogg pages rather than stalling the RTP callback.
-
 **`AudioSender`** runs ffmpeg as its encoder and starts it again when it exits. For `system` and
 `device:NAME` it also runs a `BlockCapture` (`capture.py`): a `CaptureDevice` says which PCM
 format its device delivers and makes a fresh capture for every ffmpeg run, and the capture hands
@@ -99,6 +93,24 @@ plays. One
 worker-thread call per block reads it, scales it by the Windows volume (`sysvolume.py`) and
 measures its level, so no per-sample work runs on the event loop, which then writes the block to
 ffmpeg's stdin.
+
+**`MicrophoneCapture`** (`microphone.py`) is one recording of a controller's microphone. The
+session asks the controller for it (`mic_start()`, from `--mic-capture`, `/_mic` or the
+Assistant button), takes the Opus packets that follow out of the input's way by their payload
+type and opens a recording with the first of them. `OggOpusWriter` puts every packet on an Ogg
+page of its own as it arrives, so the file is a whole stream after each write. A packet's
+length is read from its first byte, and a packet that was lost gets one in its place that asks
+the decoder to conceal it, which keeps the file as long as the sound was (a hole of more than
+a second is left out). With `--mic-pcm` a `PcmDecoder` runs one ffmpeg per recording on
+threads of its own, in a session of its own: the pages reach it through a bounded queue and
+are dropped when it falls behind, and neither its start nor its end is waited for on the
+event loop.
+
+The switch is the session's to keep true. Its request is one datagram, so it is sent again
+when neither an answer nor the sound comes within a second, four times in all; a controller
+whose sound arrives with the switch off is told to stop; and a session that ends, the
+receiver's stop included, switches the microphone off first. Push to talk reads the display
+link's own reports alone, the ones whose buttons are mapped.
 
 **`GameSession`** is the game phase of one controller: it sends `StartGame`, answers the
 `InitializationRequest` the controller proxies through the display link, runs the second
