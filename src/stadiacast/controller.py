@@ -435,7 +435,7 @@ class ControllerSession:
         """
         p = self.protos
         msg = p.DisplayToController()
-        msg.request5.value = True
+        msg.set_microphone.value = True
         ticket = self.send_rpc("request", msg, purpose="mic_capture")
         self.mic_on = True
         self.log("mic_capture", on=True, reason=reason, ticket=ticket)
@@ -445,7 +445,7 @@ class ControllerSession:
         """#5 = false stops the stream; the open capture is finalised with an Ogg EOS page."""
         p = self.protos
         msg = p.DisplayToController()
-        msg.request5.value = False
+        msg.set_microphone.value = False
         ticket = self.send_rpc("request", msg, purpose="mic_capture")
         self.mic_on = False
         self._close_mic()

@@ -284,8 +284,8 @@ class FakeController:
                 self._on_start_game(rpc["ticket"], msg.start_game)
             elif msg.HasField("set_audio_mode") and msg.set_audio_mode.mode == AUDIO_MODE_WEBRTC_OPUS:
                 self._on_set_audio_mode(rpc["ticket"])
-            elif msg.HasField("request5"):
-                self._on_mic_capture(rpc["ticket"], msg.request5.value)
+            elif msg.HasField("set_microphone"):
+                self._on_mic_capture(rpc["ticket"], msg.set_microphone.value)
             else:
                 self.endpoint.send_wire(
                     WIRE_ID_DC_RPC_CONTROLLER,
