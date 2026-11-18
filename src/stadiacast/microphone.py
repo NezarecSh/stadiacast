@@ -191,26 +191,42 @@ def _write_all(pipe: IO[bytes], data: bytes) -> None:
 
 
 class PcmDecoder:
-    """One ffmpeg for one recording: the Ogg stream goes in, s16le PCM comes out into ``path``.
+    """One ffmpeg for one Ogg stream: the stream goes in, s16le PCM comes out, into the file
+    ``path`` and to ``heard`` (either or both).
 
     None of it happens on the caller's thread, which is the event loop's. :meth:`write` puts a
     page into a queue with a limit (:data:`QUEUE_PAGES`), and :meth:`close` only says that the
     stream is over. One thread starts ffmpeg and hands it the pages. One reads the PCM, measures
-    it and writes the file. One keeps the end of what ffmpeg says, for the log. After
-    :meth:`close` the first closes ffmpeg's input behind the last page, ffmpeg decodes what it
-    still holds and ends, and the second closes the file behind the last sample: closing loses
-    nothing and waits for nothing. An ffmpeg that has not ended :data:`DECODER_EXIT_TIMEOUT`
-    after :meth:`close` is killed. :meth:`join` waits for all of it, for a caller that is not
-    the event loop.
+    it, writes the file and calls ``heard``. One keeps the end of what ffmpeg says, for the log.
+    After :meth:`close` the first closes ffmpeg's input behind the last page, ffmpeg decodes
+    what it still holds and ends, and the second closes the file behind the last sample: closing
+    loses nothing and waits for nothing. An ffmpeg that has not ended
+    :data:`DECODER_EXIT_TIMEOUT` after :meth:`close` is killed. :meth:`join` waits for all of
+    it, for a caller that is not the event loop.
+
+    ``events`` names its three log records (``mic_pcm_started`` and so on), and ``rate`` is the
+    rate of the samples, which ffmpeg converts to.
     """
 
-    def __init__(self, path: str, log: Callable[..., Any] | None = None) -> None:
+    def __init__(
+        self,
+        path: str | None,
+        log: Callable[..., Any] | None = None,
+        *,
+        rate: int = PCM_RATE,
+        heard: Callable[[bytes], Any] | None = None,
+        events: str = "mic_pcm",
+    ) -> None:
         self.log: Callable[..., Any] = log or _no_log
-        self.path: str | None = None  # the PCM file, when there is an ffmpeg to make it
+        self.path: str | None = None  # the PCM file, when one was asked for and there is an ffmpeg to make it
+        self.rate = rate
         self.reason: str | None = None  # why there is no PCM, or no more of it
         self.read_bytes = 0
         self.dropped = 0
         self.level: tuple[float, float] | None = None  # of the block read last
+        self._heard = heard
+        self._events = events
+        self._names = events.replace("_", "-")  # of its threads
         self._exe = ffmpeg_path()
         self._proc: subprocess.Popen[bytes] | None = None
         self._queue: queue.Queue[bytes | None] = queue.Queue()
@@ -218,6 +234,7 @@ class PcmDecoder:
         self._stderr: deque[bytes] = deque()
         self._lock = threading.Lock()  # for what close() and the threads decide between them
         self._closed = False
+        self._empty = False  # closed with no packet in the stream
         self._over = self._exe is None  # ffmpeg has ended, or was never started
         self._deadline: threading.Timer | None = None
         if self._exe is None:
@@ -225,7 +242,7 @@ class PcmDecoder:
             return
         self.path = path
         try:
-            self._thread(self._feed, "mic-pcm-in")
+            self._thread(self._feed, f"{self._names}-in")
         except RuntimeError as e:  # a computer out of threads: the recording goes on without the samples
             self.path = None
             self._over = True
@@ -239,7 +256,7 @@ class PcmDecoder:
 
     def _unavailable(self, reason: str) -> None:
         self.reason = reason
-        self.log("mic_pcm_unavailable", reason=reason)
+        self.log(f"{self._events}_unavailable", reason=reason)
 
     @property
     def running(self) -> bool:
@@ -260,12 +277,14 @@ class PcmDecoder:
             return
         self._queue.put_nowait(page)
 
-    def close(self) -> None:
-        """The stream is over. Returns at once; the threads see the rest through."""
+    def close(self, *, empty: bool = False) -> None:
+        """The stream is over. Returns at once; the threads see the rest through. ``empty`` says
+        that no packet was in it: ffmpeg calls that an error, and it is none."""
         with self._lock:
             if self._closed:
                 return
             self._closed = True
+            self._empty = empty
             self._queue.put_nowait(None)
             self._arm()
 
@@ -283,7 +302,7 @@ class PcmDecoder:
         if self._proc is None or self._over or self._deadline is not None:
             return
         self._deadline = threading.Timer(DECODER_EXIT_TIMEOUT, self._proc.kill)
-        self._deadline.name = "mic-pcm-end"
+        self._deadline.name = f"{self._names}-end"
         self._deadline.daemon = True
         try:
             self._deadline.start()
@@ -302,18 +321,25 @@ class PcmDecoder:
     def _feed(self) -> None:
         """Start ffmpeg, then hand it the pages until the stream is over."""
         path, exe = self.path, self._exe
-        assert path is not None and exe is not None
+        assert exe is not None
         command = [
             exe, "-hide_banner", "-loglevel", "error", "-nostats",
-            # Told the format, ffmpeg decodes from the first page on and stays one packet behind.
+            # Told the format, ffmpeg decodes from the first page on, each packet as it comes.
             # (-fflags nobuffer would drop the packet it reads while it looks at the stream.)
             "-f", "ogg", "-i", "pipe:0",
-            "-f", "s16le", "-acodec", "pcm_s16le", "-ar", str(PCM_RATE), "-ac", str(PCM_CHANNELS),
+            "-f", "s16le", "-acodec", "pcm_s16le", "-ar", str(self.rate), "-ac", str(PCM_CHANNELS),
             "-flush_packets", "1", "pipe:1",
         ]  # fmt: skip
         file: BinaryIO | None = None
         try:
-            file = open(path, "wb", buffering=0)  # noqa: SIM115
+            if path is not None:
+                file = open(path, "wb", buffering=0)  # noqa: SIM115
+        except OSError as e:
+            self.path = None
+            self._unavailable(f"no PCM file: {e}")
+            self._finish()
+            return
+        try:
             proc = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
@@ -326,23 +352,23 @@ class PcmDecoder:
                 start_new_session=True,
             )
         except OSError as e:
-            if file is not None:
+            if file is not None and path is not None:
                 file.close()
                 with contextlib.suppress(OSError):
                     os.unlink(path)
             self.path = None
-            self._unavailable(f"ffmpeg did not start: {e}" if file is not None else f"no PCM file: {e}")
+            self._unavailable(f"ffmpeg did not start: {e}")
             self._finish()
             return
         assert proc.stdin is not None
-        self.log("mic_pcm_started", ffmpeg=exe, file=path, rate=PCM_RATE, channels=PCM_CHANNELS)
+        self.log(f"{self._events}_started", ffmpeg=exe, file=path, rate=self.rate, channels=PCM_CHANNELS)
         with self._lock:
             self._proc = proc
             if self._closed:  # the recording was shorter than ffmpeg's start
                 self._arm()
         try:
-            said = self._thread(self._keep_stderr, "mic-pcm-err", proc)
-            self._thread(self._read, "mic-pcm-out", proc, file, said)
+            said = self._thread(self._keep_stderr, f"{self._names}-err", proc)
+            self._thread(self._read, f"{self._names}-out", proc, file, said)
         except RuntimeError as e:  # no thread to read it with: an ffmpeg nobody reads is of no use
             proc.kill()
             proc.wait()
@@ -352,7 +378,7 @@ class PcmDecoder:
                         end.close()
             self.reason = f"ffmpeg could not be read: {e}"
             self._finish()
-            self.log("mic_pcm_ended", status=proc.returncode, reason=self.reason, bytes=0, dropped=self.dropped)
+            self.log(f"{self._events}_ended", status=proc.returncode, reason=self.reason, bytes=0, dropped=self.dropped)
             return
         try:
             while (page := self._queue.get()) is not None:
@@ -363,13 +389,16 @@ class PcmDecoder:
             with contextlib.suppress(OSError):
                 proc.stdin.close()
 
-    def _read(self, proc: subprocess.Popen[bytes], file: BinaryIO, said: threading.Thread) -> None:
+    def _read(self, proc: subprocess.Popen[bytes], file: BinaryIO | None, said: threading.Thread) -> None:
         assert proc.stdout is not None
         odd = b""  # half a sample, when a read ended inside one
         try:
             while chunk := proc.stdout.read(8192):
                 self.read_bytes += len(chunk)
-                _write_all(file, chunk)
+                if file is not None:
+                    _write_all(file, chunk)
+                if self._heard is not None:
+                    self._heard(chunk)
                 block = odd + chunk
                 whole = len(block) - len(block) % PCM_WIDTH
                 self.level = pcm_level(block[:whole]) or self.level
@@ -380,16 +409,17 @@ class PcmDecoder:
         finally:
             for end in (file, proc.stdout):
                 with contextlib.suppress(OSError):
-                    end.close()
+                    if end is not None:
+                        end.close()
         code = proc.wait()
         self._finish()
         self._queue.put_nowait(None)  # an ffmpeg that ended by itself has the first thread waiting for pages
         said.join(1.0)  # what ffmpeg said last is read by then
         with self._lock:
             last = b"".join(self._stderr).decode(errors="replace").strip()
-        if self.reason is None and (code != 0 or not self._closed):
+        if self.reason is None and not self._empty and (code != 0 or not self._closed):
             self.reason = f"ffmpeg ended with status {code}" + (f": {last.splitlines()[-1]}" if last else "")
-        self.log("mic_pcm_ended", status=code, reason=self.reason, bytes=self.read_bytes, dropped=self.dropped)
+        self.log(f"{self._events}_ended", status=code, reason=self.reason, bytes=self.read_bytes, dropped=self.dropped)
 
     def _keep_stderr(self, proc: subprocess.Popen[bytes]) -> None:
         assert proc.stderr is not None
@@ -414,6 +444,57 @@ class PcmDecoder:
             "peak_db": None if peak is None else round(peak, 1),
             "rms_db": None if rms is None else round(rms, 1),
         }
+
+
+class PacketOrder:
+    """A stream's packets, placed as they arrive: what goes into the stream for each of them.
+
+    The sequence number says whether a packet is news: one that comes twice, or after its
+    successors, is left out, since its place in the stream is taken. The timestamp says what is
+    missing in front of it: every lost frame gets a packet of the one byte that asks the decoder
+    to conceal a frame (RFC 7845, section 4.1), up to :data:`MAX_CONCEALED_SAMPLES`.
+    :data:`RESTART_PACKETS` in a row behind the stream are a stream that began again, and the
+    stream goes on with it: ``restarted`` is told its number and the one it had.
+    """
+
+    def __init__(self, restarted: Callable[[int, int], Any] | None = None) -> None:
+        self.concealed = 0  # packets that were lost, each with a packet in its place that says so
+        self.late = 0  # packets that came twice, or after the ones behind them: left out
+        self.ignored = 0  # what was not an Opus packet, or too long for the microphone's
+        self._restarted = restarted
+        self._last_seq: int | None = None
+        self._next_ts = 0  # the RTP timestamp the next packet has when nothing is lost
+        self._behind: tuple[int, int] | None = None  # the last packet behind the stream, and how many in a row
+
+    def place(self, payload: bytes, timestamp: int, seq: int) -> list[tuple[bytes, int]]:
+        """The packets this arrival puts into the stream, each with its samples: none, or the
+        ones that stand for what was lost and then the packet itself."""
+        samples = opus_samples(payload) if len(payload) <= MAX_PACKET_BYTES else None
+        if samples is None:
+            self.ignored += 1
+            return []
+        placed: list[tuple[bytes, int]] = []
+        if self._last_seq is not None:
+            if not 0 < (seq - self._last_seq) & 0xFFFF < 0x8000:
+                follows = self._behind is not None and (seq - self._behind[0]) & 0xFFFF == 1
+                self._behind = (seq, self._behind[1] + 1 if self._behind is not None and follows else 1)
+                if self._behind[1] < RESTART_PACKETS:
+                    self.late += 1
+                    return []
+                if self._restarted is not None:
+                    self._restarted(seq, self._last_seq)
+            else:
+                missing = (timestamp - self._next_ts) & 0xFFFFFFFF
+                if 0 < missing <= MAX_CONCEALED_SAMPLES:
+                    frame = _FRAME_SAMPLES[payload[0] >> 3]
+                    lost = missing // frame
+                    placed.extend([(bytes([payload[0] & 0xFC]), frame)] * lost)  # this configuration, no data
+                    self.concealed += lost
+        self._behind = None
+        self._last_seq = seq
+        self._next_ts = (timestamp + samples) & 0xFFFFFFFF
+        placed.append((payload, samples))
+        return placed
 
 
 class _Pages:
@@ -442,14 +523,7 @@ class MicrophoneCapture:
         self.path = path
         self.packets = 0  # written as they came
         self.payload_bytes = 0
-        self.concealed = 0  # packets that were lost, each with a packet in its place that says so
-        self.late = 0  # packets that came twice, or after the ones behind them: not written
-        self.ignored = 0  # what was not an Opus packet, or too long for the microphone's
-        self._last_seq: int | None = None
-        self._next_ts = 0  # the RTP timestamp the next packet has when nothing is lost
-        self._behind: tuple[int, int] | None = (
-            None  # the last packet that came behind the stream, and how many in a row
-        )
+        self._order = PacketOrder(lambda seq, was: self.log("mic_stream_restarted", file=path, seq=seq, was=was))
         self._closed = False
         self._refused = False  # the disk refused a write: the last page will be refused too
         # Without a buffer: each page is one write, and the file is a whole Ogg stream after it,
@@ -469,42 +543,33 @@ class MicrophoneCapture:
     def pcm_path(self) -> str | None:
         return None if self.decoder is None else self.decoder.path
 
-    def write(self, payload: bytes, timestamp: int, seq: int) -> None:
-        """One RTP payload with its RTP timestamp and sequence number.
+    @property
+    def concealed(self) -> int:
+        """Packets that were lost, each with a packet in its place that says so."""
+        return self._order.concealed
 
-        The sequence number says whether the packet is news: one that comes twice, or after its
-        successors, is left out, since its place in the stream is taken. The timestamp says what
-        is missing in front of it: every lost frame gets a packet of the one byte that asks the
-        decoder to conceal a frame (RFC 7845, section 4.1), up to :data:`MAX_CONCEALED_SAMPLES`.
-        :data:`RESTART_PACKETS` in a row behind the stream are a stream that began again: the
-        recording goes on with it.
-        """
+    @property
+    def late(self) -> int:
+        """Packets that came twice, or after the ones behind them: not written."""
+        return self._order.late
+
+    @property
+    def ignored(self) -> int:
+        """What was not an Opus packet, or too long for the microphone's."""
+        return self._order.ignored
+
+    def write(self, payload: bytes, timestamp: int, seq: int) -> None:
+        """One RTP payload with its RTP timestamp and sequence number, placed by
+        :class:`PacketOrder`: left out when it is late or no packet, written behind what stands
+        for the packets lost in front of it otherwise."""
         if self._closed:
             return
-        samples = opus_samples(payload) if len(payload) <= MAX_PACKET_BYTES else None
-        if samples is None:
-            self.ignored += 1
+        placed = self._order.place(payload, timestamp, seq)
+        if not placed:
             return
         try:
-            if self._last_seq is not None:
-                if not 0 < (seq - self._last_seq) & 0xFFFF < 0x8000:
-                    follows = self._behind is not None and (seq - self._behind[0]) & 0xFFFF == 1
-                    self._behind = (seq, self._behind[1] + 1 if self._behind is not None and follows else 1)
-                    if self._behind[1] < RESTART_PACKETS:
-                        self.late += 1
-                        return
-                    self.log("mic_stream_restarted", file=self.path, seq=seq, was=self._last_seq)
-                else:
-                    missing = (timestamp - self._next_ts) & 0xFFFFFFFF
-                    if 0 < missing <= MAX_CONCEALED_SAMPLES:
-                        frame = _FRAME_SAMPLES[payload[0] >> 3]
-                        for _ in range(missing // frame):
-                            self._writer.write_packet(bytes([payload[0] & 0xFC]), frame)  # this configuration, no data
-                            self.concealed += 1
-            self._behind = None
-            self._last_seq = seq
-            self._next_ts = (timestamp + samples) & 0xFFFFFFFF
-            self._writer.write_packet(payload, samples)
+            for packet, samples in placed:
+                self._writer.write_packet(packet, samples)
         except OSError:
             self._refused = True
             raise
@@ -569,6 +634,7 @@ __all__ = [
     "MIC_PAYLOAD_TYPE",
     "MicrophoneCapture",
     "OggOpusWriter",
+    "PacketOrder",
     "PcmDecoder",
     "capture_path",
     "ogg_crc",
