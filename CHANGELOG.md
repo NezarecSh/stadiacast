@@ -7,12 +7,22 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
-- The controller's microphone, recorded. `--mic-capture on` records it for as long as a
-  controller is connected and `--mic-capture ptt` while its Assistant button is held, into Ogg
-  Opus files in the run directory that a player can open while they are being written.
-  `--mic-pcm` also decodes each recording to raw samples as it arrives, with ffmpeg.
-  `/_status` and `/_input` report the microphone. `/_mic` shows it, and switches it while the
-  receiver runs for requests over the loopback address.
+- The controller's microphone as a microphone of the computer. `--mic on` has it on for as long
+  as a controller is connected and `--mic ptt` while its Assistant button is held, and
+  `--mic-device` makes it an input device that a voice chat or any other program can choose.
+  On Linux the receiver creates "Stadia Controller microphone" in PulseAudio or PipeWire. On
+  Windows and macOS it plays into a virtual cable that is installed (VB-CABLE, BlackHole),
+  whose other side is the microphone. Several controllers share the device.
+- The controller's microphone, recorded. `--mic-record` writes it into Ogg Opus files in the
+  run directory that a player can open while they are being written, and `--mic-pcm` also
+  decodes each recording to raw samples as it arrives, with ffmpeg.
+- `/_status` and `/_input` report the microphone. `/_mic` shows it and its device, and switches
+  the microphone and its recording while the receiver runs, for requests over the loopback
+  address.
+
+### Changed
+- On macOS, `--audio-source system` takes BlackHole 2ch when there are several loopback
+  devices, whatever order the Mac lists them in.
 
 ## [1.2.1] - 2026-11-16
 

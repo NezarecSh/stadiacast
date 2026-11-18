@@ -36,8 +36,8 @@ vibrates on request and plays sound on its headset jack.
   controller for Mac games, rumble included.
 - 🎧 **Headset audio.** What the PC plays, or any file, streams to a headset plugged into the
   controller.
-- 🎤 **The controller's microphone.** Recorded on your PC, all the time or while you hold the
-  Assistant button.
+- 🎤 **The controller's microphone.** A microphone of your PC for a voice chat, all the time
+  or while you hold the Assistant button, or recorded into files.
 - 👥 **Several controllers at once**, each one its own player.
 
 <p align="center">
@@ -121,8 +121,9 @@ stadiacast --preset live --dns-upstream 192.168.1.1   # your router: the DNS sin
 - Nothing else for the basics: the receiver ships a certificate the controller accepts
   ([serving your own](docs/setup.md#certificate) is optional), and the executables include
   Python. An install from PyPI or from source needs Python 3.11 or newer.
-- Optional: ffmpeg for [headset audio](#headset-audio) and for the samples of the
-  [controller's microphone](#controller-microphone), a driver for the virtual gamepad on
+- Optional: ffmpeg for [headset audio](#headset-audio) and for the
+  [controller's microphone](#controller-microphone), a virtual audio cable for that microphone
+  on Windows and macOS, a driver for the virtual gamepad on
   [Windows](#virtual-gamepad-windows) and on [macOS](#virtual-gamepad-macos) (the one on
   [Linux](#virtual-gamepad-linux) needs none), `tcpdump` for packet captures.
 
@@ -149,7 +150,8 @@ uv sync --all-extras
 
 or with pip, `pip install -e ".[ble,passthrough,audio,gamepad]"`. An install from PyPI or
 from source has a third command, `stadiacast-show-input`. The `ble` extra is the Bluetooth
-provisioning, `audio` and `gamepad` are the [headset audio](#headset-audio) capture and the
+provisioning, `audio` is the [headset audio](#headset-audio) capture and, on Windows and
+macOS, the [controller's microphone](#controller-microphone) as a device, `gamepad` is the
 [virtual gamepad](#virtual-gamepad-windows), and `passthrough` lets the receiver fetch the
 controller's configuration (`stadiaconfig`) from Google for it, which only happens when
 `clients3.google.com` is redirected to the receiver (not by default).
@@ -195,28 +197,57 @@ install libportaudio2`). How the stream rides the display link is in
 
 ## Controller microphone
 
-The receiver can record a controller's microphone into the run directory:
+The receiver can make a controller's microphone a microphone of this computer, for a voice
+chat or any program that records, and it can record it into files. As a device it is decoded
+by ffmpeg, which has to be on `PATH`:
 
 ```sh
-stadiacast --mic-capture on             # for as long as the controller is connected
-stadiacast --mic-capture ptt            # while its Assistant button is held
-stadiacast --mic-capture ptt --mic-pcm  # the samples as well, decoded by ffmpeg
+stadiacast --mic ptt --mic-device       # a microphone while the Assistant button is held
+stadiacast --mic on --mic-device        # for as long as the controller is connected
+stadiacast --mic ptt --mic-record       # recorded into the run directory instead
 ```
 
-A recording is an Ogg Opus file, `mic_c0_184930.ogg` for the first controller at 18:49:30, and
-a player can open it while it is still being written. With `ptt` every hold of the button is a
-file of its own. `--mic-pcm` also decodes each recording as it arrives, into a `.pcm` file of
-the same name: signed 16-bit little-endian samples, 48 kHz, mono, 96 kB for every second. It is
-a recording and not a microphone of the computer: a program that wants the sound reads one of
-the two files while it grows. Nothing deletes the recordings.
+`--mic` says when the microphone is on, `--mic-device` and `--mic-record` where its sound
+goes, and both can be given. Between two holds of the button the device is silent, like a
+microphone nobody speaks into. Several controllers share the one device: what they say is
+added up. The receiver says at its start which microphone to choose in the program that
+listens:
+
+- **Linux:** "Stadia Controller microphone". The receiver creates it in PulseAudio or PipeWire
+  and removes it when it stops, through their `pactl` and `pacat` (the `pulseaudio-utils`
+  package), also when it runs with `sudo`. The output "Stadia Controller microphone feed"
+  that appears beside it is how the sound gets there: play nothing else into it. When the
+  receiver stops, the sound server moves a program that was listening to another microphone,
+  as it does when a microphone is unplugged.
+- **Windows:** `CABLE Output`. A program cannot create a microphone on Windows, so the receiver
+  plays into a virtual cable: install [VB-CABLE](https://vb-audio.com/Cable/) (run its setup
+  as administrator, then restart). If the installation made `CABLE Input` the default output
+  of Windows, choose your speakers again in the sound settings.
+- **macOS:** `BlackHole 16ch`, a loopback device that plays the same part
+  (`brew install blackhole-16ch`, then restart). The [headset audio](#headset-audio) keeps
+  BlackHole 2ch. Without 16ch the microphone takes another loopback device, BlackHole 2ch too
+  when the headset's sound is not captured from it. Send nothing else to the microphone's
+  device: a loopback device that is the Mac's sound output, alone or in a Multi-Output Device,
+  has the Mac's sound in it.
+
+On Windows and macOS `--mic-device NAME` plays into another device, named by a part of its
+name, and the device needs the `audio` extra, which the executables and
+`uv sync --all-extras` include.
+
+`--mic-record` writes Ogg Opus files, `mic_c0_184930.ogg` for the first controller at 18:49:30,
+which a player can open while they are still being written. With `ptt` every hold of the
+button is a file of its own. `--mic-pcm` also decodes each recording as it arrives, into a
+`.pcm` file of the same name: signed 16-bit little-endian samples, 48 kHz, mono, 96 kB for
+every second. Nothing deletes the recordings.
 
 The controller's light blinks while its microphone is on. With a headset plugged into the
-controller, the headset's microphone is the one recorded. The microphone takes a moment to
-start: with `ptt`, speak once the light blinks, and a press shorter than that records nothing.
+controller, the headset's microphone is the one that is sent. The microphone takes a moment to
+start: with `ptt`, speak once the light blinks, and a press shorter than that carries nothing.
 
-`/_status` reports the microphone under `microphone`, and `/_mic` shows it and switches it
-while the receiver runs ([docs/setup.md](docs/setup.md#running)). How the controller sends its
-sound is in [docs/protocol.md](docs/protocol.md#the-controllers-microphone).
+`/_status` reports the microphone under `microphone` and the device under `mic_device`, and
+`/_mic` shows both and switches the microphone while the receiver runs
+([docs/setup.md](docs/setup.md#running)). How the controller sends its sound is in
+[docs/protocol.md](docs/protocol.md#the-controllers-microphone).
 
 ## Virtual gamepad (Windows)
 

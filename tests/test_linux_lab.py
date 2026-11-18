@@ -3,8 +3,9 @@ event node the way a game reads it, a game's force feedback requests, and what t
 plays, recorded from a real sound server. Runs on Linux when STADIACAST_LINUX_LAB is set (the
 Linux lab workflow); skipped elsewhere. The pad tests need ``/dev/uinput`` and the event nodes
 to open (as root, or with the udev rule of the README), and a pad appears on the system while
-one runs: A, the left stick and the left trigger are what it presses. The sound test plays a
-tone to the default output for a few seconds, and skips without a sound server or ffmpeg."""
+one runs: A, the left stick and the left trigger are what it presses. The sound tests play a
+tone to the default output for a few seconds and make a microphone named "Stadia Controller
+microphone" for as long, and skip without a sound server or ffmpeg."""
 
 from __future__ import annotations
 
@@ -46,6 +47,8 @@ from stadiacast.uinput_gamepad import (
     ioc,
 )
 from tests.helpers import connect_firmware_flow, make_receiver, single, wait_for
+from tests.test_micdevice import loud, say
+from tests.test_microphone import real_opus
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux") or not os.environ.get("STADIACAST_LINUX_LAB"),
@@ -450,3 +453,148 @@ def test_what_the_computer_plays_reaches_the_headset(tmp_path) -> None:
     finally:
         player.kill()
         player.wait()
+
+
+def test_a_controllers_microphone_is_a_microphone_of_this_computer(tmp_path) -> None:
+    """``--mic on --mic-device`` with a real sound server: "Stadia Controller microphone" is a source
+    of its own and no monitor, what the lab controller's microphone sends is recorded from it, the
+    computer's output stays the one it was, what a receiver that was killed left behind is
+    replaced, and nothing is left when the receiver stops."""
+    if ffmpeg_path() is None:
+        pytest.skip("needs ffmpeg (with libopus) on PATH")
+    tools = [shutil.which(tool) for tool in ("pactl", "pacat", "parec")]
+    if None in tools or subprocess.run(["pactl", "info"], capture_output=True, timeout=10, check=False).returncode:
+        pytest.skip("needs a PulseAudio or PipeWire server that pactl reaches, with pacat and parec")
+
+    def pactl(*args: str) -> str:
+        said = subprocess.run(
+            ["pactl", *args], capture_output=True, text=True, timeout=10, check=True, env={**os.environ, "LC_ALL": "C"}
+        )
+        return said.stdout.strip()
+
+    def ours(kind: str) -> list[str]:
+        return [line for line in pactl("list", "short", kind).splitlines() if "stadiacast_mic" in line]
+
+    def default_sink() -> str:
+        return next(line.partition(": ")[2] for line in pactl("info").splitlines() if line.startswith("Default Sink"))
+
+    assert ours("modules") == [], "a receiver's microphone is in the sound server already"
+    output = default_sink()
+    pactl("load-module", "module-null-sink", "sink_name=stadiacast_mic_feed")  # as a receiver that was killed leaves it
+    tone = real_opus(2.0)
+    heard = tmp_path / "heard.pcm"
+
+    async def run() -> None:
+        rx = make_receiver(tmp_path, mic="on", mic_device="")
+        await rx.start()
+        recorder = fc = None
+        try:
+            assert rx.mic_device is not None and rx.log.counts.get("mic_device_left_behind") == 1
+            assert len(ours("modules")) == 2 and len(ours("sinks")) == 1
+            (source,) = (block for block in pactl("list", "sources").split("\n\n") if "Name: stadiacast_mic\n" in block)
+            assert "Description: Stadia Controller microphone\n" in source and "Monitor of Sink: n/a" in source
+            state = rx.mic_device.state()
+            assert state["error"] is None and state["server"], state
+            await wait_for(lambda: rx.mic_device.state()["flowing"], timeout=10)  # PulseAudio's sink takes its time
+            if output == "auto_null":  # a computer without a sound card: the feed is the one output it has
+                assert "is also the computer's sound output" in state["note"], state
+            else:
+                assert default_sink() == output and state["note"] is None, state
+            recording = ["parec", "--device=stadiacast_mic", "--format=s16le", "--rate=48000", "--channels=1", "--raw"]
+            with heard.open("wb") as fh:
+                recorder = subprocess.Popen([*recording, "--latency-msec=20"], stdout=fh)
+                fc = await connect_firmware_flow(rx)
+                await asyncio.wait_for(fc.display_ready.wait(), 5)
+                await fc.keepalive()
+                await wait_for(lambda: fc.mic_requests == [True])
+                await asyncio.sleep(0.5)  # the recorder has begun
+                assert recorder.poll() is None, "parec could not record the microphone"
+                await say(fc, tone)
+                await asyncio.sleep(0.5)
+            voice = rx.mic_device.state()["voices"]["c0"]
+            assert (voice["packets"], voice["late"]) == (len(tone), 0), voice
+        finally:
+            if recorder is not None:
+                recorder.terminate()
+                recorder.wait()
+            if fc is not None:
+                fc.close()
+            await rx.stop()
+
+    try:
+        asyncio.run(run())
+    finally:
+        left = ours("modules")
+        for line in left:
+            subprocess.run(["pactl", "unload-module", line.split()[0]], check=False, timeout=10)
+    assert left == [] and ours("sources") == [] and default_sink() == output
+    recorded = heard.read_bytes()
+    pieces = [recorded[at : at + 1920] for at in range(0, len(recorded) - 1919, 1920)]
+    sounding = [n for n, piece in enumerate(pieces) if loud([piece], 440)]
+    holes = sounding[-1] - sounding[0] + 1 - len(sounding)
+    print(f"the microphone through the sound server: {len(sounding)} of {len(tone)} pieces, {holes} holes")
+    assert len(sounding) >= len(tone) - 6 and holes <= 2, (len(pieces), len(sounding), holes)  # two seconds of it
+
+
+def test_a_sink_that_is_taken_from_the_receiver_is_never_played_elsewhere(tmp_path) -> None:
+    """A sound server moves a stream whose sink is unloaded to the computer's own output, where
+    the microphone would be heard. The receiver's stream is ended instead, and the device is
+    made anew."""
+    if ffmpeg_path() is None:
+        pytest.skip("needs ffmpeg (with libopus) on PATH")
+    tools = [shutil.which(tool) for tool in ("pactl", "pacat", "parec")]
+    if None in tools or subprocess.run(["pactl", "info"], capture_output=True, timeout=10, check=False).returncode:
+        pytest.skip("needs a PulseAudio or PipeWire server that pactl reaches, with pacat and parec")
+
+    def pactl(*args: str) -> str:
+        said = subprocess.run(
+            ["pactl", *args], capture_output=True, text=True, timeout=10, check=True, env={**os.environ, "LC_ALL": "C"}
+        )
+        return said.stdout.strip()
+
+    def ours() -> list[str]:
+        return [line for line in pactl("list", "short", "modules").splitlines() if "stadiacast_mic" in line]
+
+    def elsewhere() -> list[str]:
+        """The sinks other than the microphone's that a stream of the receiver plays on."""
+        names = {line.split()[0]: line.split()[1] for line in pactl("list", "short", "sinks").splitlines()}
+        found = []
+        for stream in pactl("list", "sink-inputs").split("\n\n"):
+            if 'application.name = "Stadiacast"' in stream:
+                sink = next(line.split()[1] for line in stream.splitlines() if line.strip().startswith("Sink:"))
+                if sink in names and names[sink] != "stadiacast_mic_feed":  # not on a sink at all is nowhere
+                    found.append(names[sink])
+        return found
+
+    assert ours() == [], "a receiver's microphone is in the sound server already"
+
+    async def run() -> None:
+        rx = make_receiver(tmp_path, mic="on", mic_device="")
+        await rx.start()
+        try:
+            assert rx.mic_device is not None
+            await wait_for(lambda: rx.mic_device.state()["flowing"], timeout=10)
+            assert elsewhere() == []
+            sink = next(line.split()[0] for line in ours() if "module-null-sink" in line)
+            pactl("unload-module", sink)
+            seen: list[str] = []
+            deadline = time.monotonic() + 20
+            while rx.log.counts.get("mic_device_back", 0) == 0:
+                assert time.monotonic() < deadline, f"the device did not come back: {rx.mic_device.state()}"
+                seen += elsewhere()
+                await asyncio.sleep(0.05)
+            assert seen == [], f"the microphone's stream was on {sorted(set(seen))}"
+            lost = next(r for r in rx.log.records if r["event"] == "mic_device_lost")
+            print(f"the sink was taken away: {lost['error']}")
+            assert len(ours()) == 2 and elsewhere() == []
+            await wait_for(lambda: rx.mic_device.state()["flowing"], timeout=10)
+        finally:
+            await rx.stop()
+
+    try:
+        asyncio.run(run())
+    finally:
+        left = ours()
+        for line in left:
+            subprocess.run(["pactl", "unload-module", line.split()[0]], check=False, timeout=10)
+    assert left == []

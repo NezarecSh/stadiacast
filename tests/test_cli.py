@@ -242,9 +242,9 @@ def test_a_shutdown_request_stops_the_receiver_as_ctrl_c_does(tmp_path, capsys):
     ("mode", "says"),
     [("off", None), ("on", "for as long as they are connected"), ("ptt", "while their Assistant button is held")],
 )
-def test_the_start_says_when_microphones_are_recorded(tmp_path, capsys, mode, says):
+def test_the_start_says_when_microphones_are_on_and_where_they_go(tmp_path, capsys, mode, says):
     async def run() -> str:
-        task = asyncio.get_running_loop().create_task(cli.amain(lab_config(tmp_path, mic_capture=mode)))
+        task = asyncio.get_running_loop().create_task(cli.amain(lab_config(tmp_path, mic=mode, mic_record=True)))
         out = ""
         for _ in range(200):
             out += capsys.readouterr().out
@@ -261,7 +261,31 @@ def test_the_start_says_when_microphones_are_recorded(tmp_path, capsys, mode, sa
     if says is None:
         assert "microphone" not in out
     else:
-        assert f"the controllers' microphones are recorded {says} (--mic-capture {mode})." in out
+        assert f"the controllers' microphones are on {says} (--mic {mode}), recorded into the run directory." in out
+
+
+def test_the_start_names_the_device_a_program_chooses(tmp_path):
+    def said(heard_as: str | None, note: str | None = None, **settings) -> str:
+        return cli.microphone_notice(lab_config(tmp_path, **settings), heard_as, note)
+
+    linux = 'the microphone "Stadia Controller microphone"'
+    assert said(linux, mic="ptt", mic_device="") == (
+        "the controllers' microphones are on while their Assistant button is held (--mic ptt),"
+        ' as the microphone "Stadia Controller microphone" of this computer.\n'
+    )
+    cable = 'the microphone "CABLE Output (VB-Audio Virtual Cable)"'
+    assert said(cable, mic="on", mic_device="", mic_record=True) == (
+        "the controllers' microphones are on for as long as they are connected (--mic on),"
+        ' as the microphone "CABLE Output (VB-Audio Virtual Cable)" of this computer and recorded into the run'
+        " directory.\n"
+    )
+    assert said('the microphone "BlackHole 16ch"', mic_device="") == (
+        "the controllers' microphones are off until /_mic switches one on: it is then the microphone"
+        ' "BlackHole 16ch".\n'
+    )
+    noted = said(cable, '"CABLE Input" is also the computer\'s sound output', mic="ptt", mic_device="")
+    assert noted.splitlines()[1] == '"CABLE Input" is also the computer\'s sound output.'
+    assert said(None) == ""
 
 
 def test_a_start_that_fails_stops_what_it_started_and_reports_the_port(tmp_path, capsys):

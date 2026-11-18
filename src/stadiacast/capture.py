@@ -47,6 +47,10 @@ QUEUE_BLOCKS = 24
 #: What ``parec`` is asked for: the headset stream's own format, so that nothing is resampled.
 PULSE_RATE, PULSE_CHANNELS = 48000, 2
 
+#: The sink the controllers' microphones are played into on Linux (``--mic-device``): what is
+#: played there must never reach the headset.
+MIC_FEED_SINK = "stadiacast_mic_feed"
+
 
 class BlockCapture(abc.ABC):
     """A running capture as the sender sees it: interleaved int16 blocks from a bounded queue.
@@ -114,11 +118,11 @@ class CaptureDevice(abc.ABC):
         """A fresh, not yet started capture of this device."""
 
 
-def _sounddevice() -> Any:
+def _sounddevice(what: str = "system audio capture") -> Any:
     try:
         import sounddevice
     except ImportError as e:
-        raise SetupError("system audio capture needs the audio extra: pip install 'stadiacast[audio]'") from e
+        raise SetupError(f"{what} needs the audio extra: pip install 'stadiacast[audio]'") from e
     except OSError as e:  # the binding is there but not the library it wraps
         raise SetupError(f"PortAudio is missing ({e}); on Linux install libportaudio2") from e
     except Exception as e:
@@ -197,11 +201,11 @@ def portaudio_devices() -> list[PortAudioDevice]:
 
 
 def pick_loopback(names: list[str]) -> str | None:
-    """The first device that looks like a loopback of the computer's output, if any."""
-    for name in names:
-        if any(hint in name.lower() for hint in LOOPBACK_HINTS):
-            return name
-    return None
+    """The device that looks like a loopback of the computer's output: BlackHole 2ch, which the
+    headset's sound is sent to, whatever order the devices are listed in; or else the first
+    whose name says it is one."""
+    loops = [name for name in names if any(hint in name.lower() for hint in LOOPBACK_HINTS)]
+    return next((name for name in loops if name.lower() == "blackhole 2ch"), None) or next(iter(loops), None)
 
 
 def sound_server_user() -> dict[str, Any]:
@@ -381,6 +385,7 @@ def list_devices() -> list[str]:
 __all__ = [
     "BLOCK",
     "LOOPBACK_HINTS",
+    "MIC_FEED_SINK",
     "QUEUE_BLOCKS",
     "BlockCapture",
     "CaptureDevice",

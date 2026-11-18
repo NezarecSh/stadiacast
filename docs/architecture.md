@@ -35,6 +35,9 @@ Receiver                                   one per process (receiver.py)
  ├── Protos                                the protobuf schemas, loaded once (protos.py)
  ├── EventLog                              server.jsonl + console echo (log.py)
  ├── VirtualGamepads                       --gamepad: one virtual pad per controller (virtual_gamepad.py)
+ ├── MicrophoneDevice                      --mic-device: the microphones as a device of this computer (micdevice.py)
+ │    ├── Voice  c0, c1, ...               one controller's Opus, decoded by an ffmpeg of its own
+ │    └── Output                           the device: made (Linux) or played into (Windows, macOS)
  └── ControllerSession  c0, c1, ...        one per controller (controller.py)
       ├── RtcEndpoint "input"              UDP socket of the display link (rtc/endpoint.py)
       │    ├── StunMessage / ICE checks    rtc/stun.py
@@ -95,16 +98,33 @@ measures its level, so no per-sample work runs on the event loop, which then wri
 ffmpeg's stdin.
 
 **`MicrophoneCapture`** (`microphone.py`) is one recording of a controller's microphone. The
-session asks the controller for it (`mic_start()`, from `--mic-capture`, `/_mic` or the
-Assistant button), takes the Opus packets that follow out of the input's way by their payload
-type and opens a recording with the first of them. `OggOpusWriter` puts every packet on an Ogg
-page of its own as it arrives, so the file is a whole stream after each write. A packet's
-length is read from its first byte, and a packet that was lost gets one in its place that asks
-the decoder to conceal it, which keeps the file as long as the sound was (a hole of more than
-a second is left out). With `--mic-pcm` a `PcmDecoder` runs one ffmpeg per recording on
-threads of its own, in a session of its own: the pages reach it through a bounded queue and
-are dropped when it falls behind, and neither its start nor its end is waited for on the
-event loop.
+session asks the controller for it (`mic_start()`, from `--mic`, `/_mic` or the Assistant
+button) and takes the Opus packets that follow out of the input's way by their payload type.
+With `--mic-record` the first of them opens a recording. `OggOpusWriter` puts every packet on
+an Ogg page of its own as it arrives, so the file is a whole stream after each write.
+`PacketOrder` puts the packets in order: a packet's length is read from its first byte, and a
+packet that was lost gets one in its place that asks the decoder to conceal it, which keeps
+the file as long as the sound was (a hole of more than a second is left out). With `--mic-pcm`
+a `PcmDecoder` runs one ffmpeg per recording on threads of its own, in a session of its own:
+the pages reach it through a bounded queue and are dropped when it falls behind, and neither
+its start nor its end is waited for on the event loop.
+
+**`MicrophoneDevice`** (`micdevice.py`, `--mic-device`) belongs to the `Receiver` and is the
+controllers' microphones as one input device of the computer. Each session hands it the same
+packets (`feed`), and a `Voice` per controller sends them through a `PcmDecoder` that stays
+for as long as the controller does, as one Ogg stream over all the times the microphone is
+on. What comes back waits in the voice: it holds 80 ms before it speaks, which evens out the
+network, and lets go of sound that would put it further behind. The `Output` asks for 20 ms at
+a time, at the pace of its own clock, and gets the voices added up or silence, so a program
+that records the device never waits for it. `PulseOutput` (Linux) loads a null sink and a
+source remapped over its monitor into the sound server, each marked with the receiver's
+process, plays into the sink through `pacat`, ends that stream should the server move it to
+another output, and unloads both at the end; `WasapiOutput` (Windows) and `PortAudioOutput`
+(macOS) play into a virtual cable that is installed, found by its name. Without a name they
+take only a cable; they refuse the computer's own speakers and the device the headset's sound
+is captured from, and a device that was named and does not look like a cable is taken with a
+note that says so. An output that stops asking, or whose device is gone, is opened again by the
+`MicrophoneDevice` until it is back, and a voice whose ffmpeg ended gets a new one.
 
 The switch is the session's to keep true. Its request is one datagram, so it is sent again
 when neither an answer nor the sound comes within a second, four times in all; a controller
@@ -254,6 +274,7 @@ real controller the receiver runs with `--preset live` on ports 53/80/123/443, w
 | a new message on the game session | `GameSession._on_app_data` / `_on_rpc` |
 | an output for the decoded input | consume `Receiver.wait_event()` / `publish_event()` events; `virtual_gamepad.py` is one |
 | a new audio capture | a `CaptureDevice` and `BlockCapture` pair (`capture.py`; `loopback.py` is one), chosen in `Source.device` (`audio.py`) |
+| another way to make the microphone a device | an `Output` (`micdevice.py`), chosen in `open_output` |
 | a new helper process | a module under `helpers/` with a `main(argv)`, named in `HELPERS` (`helpers/__init__.py`), started by `Receiver._spawn_helper` |
 | something the user must install or configure | raise `SetupError` (`errors.py`) with a message that says what to install; the command line prints it as one line |
 | a schema change | the `.proto` under `schemas/`, then `python -m stadiacast.schema_compiler` |

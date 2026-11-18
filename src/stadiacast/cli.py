@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from stadiacast import __version__
-from stadiacast.config import AUDIO_APPLICATIONS, MIC_CAPTURE_MODES, PRESETS, Config
+from stadiacast.config import AUDIO_APPLICATIONS, MIC_MODES, PRESETS, Config
 from stadiacast.errors import SetupError
 from stadiacast.game_session import GAME_FRAMINGS, GAME_KEY_MAX, HAPTICS_WATCHDOG_S
 from stadiacast.helpers import HELPER_FLAG, run_helper
@@ -279,16 +279,32 @@ def build_parser(preset: str | None = None) -> argparse.ArgumentParser:
 
     g = ap.add_argument_group("controller microphone")
     g.add_argument(
-        "--mic-capture",
-        choices=MIC_CAPTURE_MODES,
+        "--mic",
+        choices=MIC_MODES,
         default="off",
-        help="record the controller's microphone to Ogg files in the run directory: on from the moment the "
-        "link is READY, ptt while the Assistant button is held (POST /_mic switches it too)",
+        help="when the controller's microphone is on: on from the moment the link is READY, ptt while the "
+        "Assistant button is held (POST /_mic switches it too); where it goes is --mic-device, --mic-record or both",
+    )
+    g.add_argument(
+        "--mic-device",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="NAME",
+        help="make it a microphone of this computer: on Linux a device the receiver creates, on Windows and "
+        "macOS the loopback device it is played into (VB-CABLE, or the Mac's loopback device besides the one "
+        "the headset's sound uses, unless NAME says another); decoded by ffmpeg",
+    )
+    g.add_argument(
+        "--mic-record",
+        action="store_true",
+        help="record it to Ogg files in the run directory, one for each time it is on",
     )
     g.add_argument(
         "--mic-pcm",
         action="store_true",
-        help="decode each recording with ffmpeg as it arrives, to s16le 48 kHz mono in a .pcm file beside the .ogg",
+        help="with --mic-record: decode each recording with ffmpeg as it arrives, to s16le 48 kHz mono in a .pcm "
+        "file beside the .ogg",
     )
 
     g = ap.add_argument_group("virtual gamepad")
@@ -428,6 +444,12 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         ap.error(f"--rumble-refresh must be > 0 and < {HAPTICS_WATCHDOG_S:g} s (the haptics watchdog)")
     if a.start_game and len(a.start_game.encode()) > GAME_KEY_MAX:
         ap.error(f"--start-game: the key is limited to {GAME_KEY_MAX} bytes")
+    if a.mic != "off" and a.mic_device is None and not a.mic_record:
+        ap.error(
+            f"--mic {a.mic} switches the microphone on and sends it nowhere: add --mic-device, --mic-record or both"
+        )
+    if a.mic_pcm and not a.mic_record:
+        ap.error("--mic-pcm decodes the recordings of --mic-record, which is not given")
     if not wire_id_valid(a.rpc_wire_id):
         ap.error(f"--rpc-wire-id {a.rpc_wire_id:#x}: the controller drops it (valid: 1..255, 0xfffe, 0xffff)")
     rpc_responses: dict[str, bytes] = {}
@@ -487,7 +509,9 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         audio_application=a.audio_application,
         audio_volume=a.audio_volume,
         audio_follow_volume=a.audio_follow_volume == "on",
-        mic_capture=a.mic_capture,
+        mic=a.mic,
+        mic_device=a.mic_device,
+        mic_record=a.mic_record,
         mic_pcm=a.mic_pcm,
         gamepad=a.gamepad,
         gamepad_deadzone=a.gamepad_deadzone == "on",
@@ -515,11 +539,29 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
     )
 
 
-#: What the start says when ``--mic-capture`` will make microphones record.
+#: What the start says about when ``--mic`` has the controllers' microphones on.
 MIC_NOTICES = {
-    "on": "the controllers' microphones are recorded for as long as they are connected (--mic-capture on).",
-    "ptt": "the controllers' microphones are recorded while their Assistant button is held (--mic-capture ptt).",
+    "on": "the controllers' microphones are on for as long as they are connected (--mic on)",
+    "ptt": "the controllers' microphones are on while their Assistant button is held (--mic ptt)",
 }
+
+
+def microphone_notice(cfg: Config, heard_as: str | None, note: str | None = None) -> str:
+    """The lines of the start that say what becomes of the controllers' microphones, or nothing.
+    ``heard_as`` is what a program is pointed at to hear them, when they are a device of this
+    computer, and ``note`` what that device has to say for itself."""
+    lines = []
+    where = [
+        *([f"as {heard_as} of this computer"] if heard_as else []),
+        *(["recorded into the run directory"] if cfg.mic_record else []),
+    ]
+    if cfg.mic in MIC_NOTICES:
+        lines.append(f"{MIC_NOTICES[cfg.mic]}, {' and '.join(where)}.")
+    elif heard_as:
+        lines.append(f"the controllers' microphones are off until /_mic switches one on: it is then {heard_as}.")
+    if note:
+        lines.append(f"{note}.")
+    return "".join(line + "\n" for line in lines)
 
 
 async def amain(cfg: Config) -> int:
@@ -533,11 +575,12 @@ async def amain(cfg: Config) -> int:
             pass
     try:
         await receiver.start()
-        recorded = MIC_NOTICES.get(cfg.mic_capture)
+        device = receiver.mic_device.output if receiver.mic_device is not None else None
+        heard_as, note = (device.heard_as(), device.note) if device is not None else (None, None)
         print(
             f"\nstadiacast {__version__} ready: https :{receiver.http.https_port}  http {receiver.http.http_ports}  "
             f"udp {cfg.advertise_ip}:{cfg.udp_port}/{cfg.game_udp_port} (+2 per controller)  logs {cfg.log_dir}\n"
-            + (f"{recorded}\n" if recorded else "")
+            + microphone_notice(cfg, heard_as, note)
             + "wake the controller(s) now; Ctrl-C to stop.\n",
             flush=True,
         )

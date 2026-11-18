@@ -23,19 +23,23 @@ anywhere else:
   and `/_start_game` act on a controller. `/_audio` starts and stops the stream to a
   controller's headset from a sound file of this computer, from what the computer plays or from
   one of its capture devices, a microphone included. `/_mic` shows whether a controller's
-  microphone is being recorded, into which file and, with `--mic-pcm`, how loud the sound is;
-  switching it is taken over the loopback address only, so a controller's microphone records
-  when the receiver was started with `--mic-capture` or its own computer asks. `/_shutdown` stops the receiver and is taken over
-  the loopback address only as well. What a browser sends on behalf of a web page is refused
-  (any request other than `GET` that carries an `Origin` header).
+  microphone is on, which device of the computer carries it, into which file it is recorded
+  and, with `--mic-pcm` or `--mic-device`, how loud the sound is; switching it is taken over
+  the loopback address only, so a controller's microphone is on when the receiver was started
+  with `--mic` or its own computer asks. `/_shutdown` stops the receiver and is taken over the
+  loopback address only as well. What a browser sends on behalf of a web page is refused (any
+  request other than `GET` that carries an `Origin` header).
 - **It impersonates Google hostnames** for the clients that resolve names through its DNS sink,
   and the sink answers whoever asks it. Only point the devices at it that you want to talk to
   the receiver; names it does not redirect are forwarded to your resolver unchanged.
 - **The run directory is private data.** `captures/<stamp>/` holds every request body the
   controller sent and a log with its serial number, device ids, addresses and the certificates
   and tokens it presents, and `dns.jsonl` lists every name looked up through the sink. With
-  `--mic-capture` it also holds what the controllers' microphones heard. Captures are ignored
+  `--mic-record` it also holds what the controllers' microphones heard. Captures are ignored
   by git; cut them down before you share one.
+- **The microphone device is a device like any other.** With `--mic-device` every program on
+  the computer that may record can hear the controllers' microphones while they are on, as it
+  can a microphone that is plugged in.
 - **The built-in certificate proves nothing.** Its private key ships with the package, so TLS
   on this server satisfies the controller's check and protects no one. A certificate of your
   own under `certs/` is different: its key is a real key for a domain you own. Keep it

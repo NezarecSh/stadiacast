@@ -20,6 +20,7 @@ import json
 import os
 import re
 import socket
+import sys
 import time
 import traceback
 from typing import Any
@@ -29,7 +30,7 @@ from google.protobuf import json_format
 from google.protobuf.message import DecodeError
 
 from stadiacast import SERVER_NAME, __version__
-from stadiacast.audio import ffmpeg_path
+from stadiacast.audio import ffmpeg_path, source_from_spec
 from stadiacast.certs import ensure_certificate, resolve_clock_pin
 from stadiacast.config import CLEARCUT_HOSTS, Config
 from stadiacast.controller import ControllerSession
@@ -37,6 +38,7 @@ from stadiacast.errors import SetupError
 from stadiacast.helpers import DNS_SINK, SNTP_SERVER, helper_command
 from stadiacast.http_server import HttpRequest, HttpResponse, HttpServer
 from stadiacast.log import EventLog
+from stadiacast.micdevice import MicrophoneDevice, open_output
 from stadiacast.netutil import bind_hint, fetch_upstream, is_loopback, local_ip_towards
 from stadiacast.protos import Protos, decode_unknown, printable
 from stadiacast.virtual_gamepad import VirtualGamepads
@@ -122,6 +124,7 @@ class Receiver:
         self.http = HttpServer(cfg, self.log, self.handle, self.now)
         self.controllers: dict[str, ControllerSession] = {}  # label -> session, in creation order
         self.gamepads: VirtualGamepads | None = None  # --gamepad: a virtual pad per controller
+        self.mic_device: MicrophoneDevice | None = None  # --mic-device: the microphones as a device of this computer
         self._by_id: dict[str, ControllerSession] = {}  # device ids and serials
         self._by_ip: dict[str, ControllerSession] = {}  # latest controller seen from an address
         self._by_token: dict[str, ControllerSession] = {}  # display token -> session (GMsg attribution)
@@ -155,6 +158,8 @@ class Receiver:
         self.events = asyncio.Queue(maxsize=EVENTS_KEPT)
         if self.cfg.mic_pcm and ffmpeg_path() is None:  # said before anything is made
             raise SetupError("--mic-pcm decodes the recordings with ffmpeg, and none was found on PATH")
+        if self.cfg.mic_device is not None and ffmpeg_path() is None:
+            raise SetupError("--mic-device decodes the microphone with ffmpeg, and none was found on PATH")
         ensure_certificate(self.cfg, self.log)
         if self.cfg.gamepad != "off" and self.gamepads is None:
             self.gamepads = VirtualGamepads.create(self.cfg, self.log, self)
@@ -178,6 +183,10 @@ class Receiver:
             )
         await self.http.start()
         self._check_udp_ports()
+        # Behind the ports: a receiver that was started twice by mistake ends on them, before it
+        # touches the sound system the first one is using.
+        if self.cfg.mic_device is not None and self.mic_device is None:
+            self.mic_device = await asyncio.to_thread(self._open_mic_device)  # it asks the sound system
         if self.cfg.dns_upstream:
             await self._start_dns()
         if self.cfg.sntp:
@@ -200,9 +209,31 @@ class Receiver:
             clearcut_block=self.cfg.clearcut_block,
             rpc_wire_id=f"{self.cfg.rpc_wire_id:#04x}",
             start_game=self.cfg.start_game,
-            mic_capture=self.cfg.mic_capture,
+            mic=self.cfg.mic,
+            mic_device=None if self.mic_device is None else self.mic_device.output.name,
+            mic_record=self.cfg.mic_record,
             log_dir=self.cfg.log_dir,
         )
+
+    def _open_mic_device(self) -> MicrophoneDevice:
+        """``--mic-device``: the device, found or made, and running. Not for the event loop."""
+        device = MicrophoneDevice(
+            open_output(self.cfg.mic_device or None, avoid=self._headset_capture(), log=self.log), self.log
+        )
+        device.start()
+        return device
+
+    def _headset_capture(self) -> str | None:
+        """The device ``--audio-source`` captures the computer's sound from, as the capture names
+        it, where the microphone is played into a device of that kind (Windows, macOS): played
+        into that very one, it would go back into the headset."""
+        spec = self.cfg.audio_source or ""
+        if sys.platform.startswith("linux") or not (spec == "system" or spec.startswith("device:")):
+            return None
+        try:
+            return source_from_spec(spec).label.removeprefix("capture ")
+        except (SetupError, ValueError):  # no such device: the headset stream will say so itself
+            return None
 
     def _check_udp_ports(self) -> None:
         """A controller's two UDP sockets are opened when it first shows up.  Taken ports would
@@ -225,6 +256,8 @@ class Receiver:
         for ctl in list(self.controllers.values()):
             ctl.stop()
         await asyncio.gather(*(ctl.wait_microphone_closed() for ctl in self.controllers.values()))
+        if self.mic_device is not None:
+            await asyncio.to_thread(self.mic_device.stop)  # the device is removed, the voices end
         if self.gamepads is not None:
             self.gamepads.close()
             await self.gamepads.wait_closed()
@@ -630,18 +663,21 @@ class Receiver:
     def _mic(self, req: HttpRequest) -> HttpResponse:
         """``/_mic``: a controller's microphone.
 
-        ``GET`` shows the switch and the recordings and ignores any body, so a read never opens
-        the microphone.  ``POST`` takes ``{"do": ...}``: ``on`` or ``off`` (the switch), ``pcm``
-        (``on``: whether recordings are decoded to PCM as well) or ``ptt`` (``on``: whether the
-        Assistant button is the switch).  A ``POST`` is taken over the loopback address only: who
-        may make a microphone record is whoever sits at the receiver's computer, or started it
-        with ``--mic-capture``.  ``on`` for a controller whose link is not READY is a 409.
+        ``GET`` shows the switch, the recordings and the computer's device, and ignores any
+        body, so a read never opens the microphone.  ``POST`` takes ``{"do": ...}``: ``on`` or
+        ``off`` (the switch), ``record`` (``on``: whether what arrives is written into files),
+        ``pcm`` (``on``: whether recordings are decoded to PCM as well) or ``ptt`` (``on``: whether
+        the Assistant button is the switch).  A ``POST`` is taken over the loopback address only:
+        who may open a microphone is whoever sits at the receiver's computer, or started it with
+        ``--mic``.  ``on`` is a 409 for a controller whose link is not READY, and while nothing
+        would take the sound, neither a device nor a recording.
         """
         if req.method == "GET":
             picked = self._pick(req)
             if isinstance(picked, HttpResponse):
                 return picked
-            return self._json(200, {**picked.mic_state(), "controller": picked.label}, handler="mic")
+            device = None if self.mic_device is None else self.mic_device.state()
+            return self._json(200, {**picked.mic_state(), "controller": picked.label, "device": device}, handler="mic")
         if req.method != "POST":
             return HttpResponse(405, b"", handler="mic")
         if req.peer is None or not is_loopback(req.peer[0]):
@@ -658,12 +694,19 @@ class Receiver:
             return picked
         action, on = body.get("do"), body.get("on", True)
         if action in ("on", "off") and "on" in body:  # {"do": "on", "on": false} would switch it on
-            return self._json(400, {"error": "do says on or off by itself; on goes with pcm and ptt"}, handler="mic")
-        if action in ("pcm", "ptt") and not isinstance(on, bool):
+            return self._json(
+                400, {"error": "do says on or off by itself; on goes with pcm, ptt and record"}, handler="mic"
+            )
+        if action in ("pcm", "ptt", "record") and not isinstance(on, bool):
             return self._json(400, {"error": "on is true or false"}, handler="mic")
         if action == "on":
             out: dict[str, Any] = picked.mic_start(reason="api")
-            if not out["ok"]:
+            if out.pop("nowhere", False):
+                out["error"] = (
+                    "nothing takes the microphone: start the receiver with --mic-device or --mic-record, or switch"
+                    ' the recording on first ({"do": "record", "on": true})'
+                )
+            elif not out["ok"]:
                 out["error"] = "the display link is not READY: nothing was sent"
         elif action == "off":
             out = picked.mic_stop(reason="api")
@@ -675,10 +718,12 @@ class Receiver:
                 return self._json(400, {"error": str(e)}, handler="mic")
         elif action == "ptt":
             out = picked.set_mic_ptt(on)
+        elif action == "record":
+            out = picked.set_mic_record(on)
         else:
             return self._json(
                 400,
-                {"error": f"unknown do={action!r}", "actions": ["on", "off", "pcm", "ptt"]},
+                {"error": f"unknown do={action!r}", "actions": ["on", "off", "pcm", "ptt", "record"]},
                 handler="mic",
             )
         out["controller"] = picked.label
@@ -1001,6 +1046,7 @@ class Receiver:
             "controllers": {ctl.label: ctl.status() for ctl in self.controllers.values()},
             "advertise_ip": self.cfg.advertise_ip,
             "gamepads": self.gamepads.status() if self.gamepads is not None else None,
+            "mic_device": self.mic_device.state() if self.mic_device is not None else None,
             "event_counts": self.log.counts,
             "log_dir": self.cfg.log_dir,
         }

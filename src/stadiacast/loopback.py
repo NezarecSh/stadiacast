@@ -23,11 +23,11 @@ from stadiacast.capture import BLOCK, BlockCapture, CaptureDevice
 from stadiacast.errors import SetupError
 
 
-def _pyaudio() -> Any:
+def _pyaudio(what: str = "system audio on Windows") -> Any:
     try:
         import pyaudiowpatch
     except ImportError as e:
-        raise SetupError("system audio on Windows needs the audio extra: pip install 'stadiacast[audio]'") from e
+        raise SetupError(f"{what} needs the audio extra: pip install 'stadiacast[audio]'") from e
     return pyaudiowpatch
 
 

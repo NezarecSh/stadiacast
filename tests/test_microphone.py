@@ -587,14 +587,24 @@ def test_the_answer_to_a_controllers_offer_names_no_audio_format() -> None:
     assert (echoed.channels, echoed.sample_rate) == (1, 16000)
 
 
-def test_the_flags_default_to_no_microphone() -> None:
+def test_the_flags_default_to_no_microphone(capsys: pytest.CaptureFixture[str]) -> None:
     for args in (["--self-signed"], ["--preset", "live"]):
         cfg = parse_args(args)
-        assert (cfg.mic_capture, cfg.mic_pcm) == ("off", False), args
-    cfg = parse_args(["--self-signed", "--mic-capture", "ptt", "--mic-pcm"])
-    assert (cfg.mic_capture, cfg.mic_pcm) == ("ptt", True)
-    with pytest.raises(SystemExit):
-        parse_args(["--self-signed", "--mic-capture", "always"])
+        assert (cfg.mic, cfg.mic_device, cfg.mic_record, cfg.mic_pcm) == ("off", None, False, False), args
+    cfg = parse_args(["--self-signed", "--mic", "ptt", "--mic-record", "--mic-pcm"])
+    assert (cfg.mic, cfg.mic_device, cfg.mic_record, cfg.mic_pcm) == ("ptt", None, True, True)
+    cfg = parse_args(["--self-signed", "--mic", "on", "--mic-device"])  # the system's own device
+    assert (cfg.mic, cfg.mic_device, cfg.mic_record) == ("on", "", False)
+    cfg = parse_args(["--self-signed", "--mic-device", "BlackHole 16ch", "--mic-record"])  # switched by /_mic
+    assert (cfg.mic, cfg.mic_device, cfg.mic_record) == ("off", "BlackHole 16ch", True)
+    for args, says in (
+        (["--mic", "always"], "invalid choice"),
+        (["--mic", "on"], "switches the microphone on and sends it nowhere"),
+        (["--mic", "ptt", "--mic-device", "--mic-pcm"], "--mic-pcm decodes the recordings of --mic-record"),
+    ):
+        with pytest.raises(SystemExit):
+            parse_args(["--self-signed", *args])
+        assert says in capsys.readouterr().err
 
 
 def test_the_receiver_does_not_start_with_mic_pcm_and_no_ffmpeg(
@@ -603,7 +613,7 @@ def test_the_receiver_does_not_start_with_mic_pcm_and_no_ffmpeg(
     monkeypatch.setattr(receiver, "ffmpeg_path", lambda: None)
 
     async def run() -> None:
-        rx = make_receiver(tmp_path, mic_capture="on", mic_pcm=True)
+        rx = make_receiver(tmp_path, mic="on", mic_record=True, mic_pcm=True)
         try:
             with pytest.raises(SetupError, match="--mic-pcm decodes the recordings with ffmpeg"):
                 await rx.start()
@@ -628,7 +638,7 @@ def test_the_switch_starts_the_microphone_and_its_packets_are_a_recording_not_in
     none of it is taken for the input protocol, and false ends the recording."""
 
     async def run() -> None:
-        rx = make_receiver(tmp_path)
+        rx = make_receiver(tmp_path, mic_record=True)
         await rx.start()
         fc = await connect_firmware_flow(rx)
         cs = single(rx)
@@ -638,6 +648,7 @@ def test_the_switch_starts_the_microphone_and_its_packets_are_a_recording_not_in
             assert cs.mic_state() == {
                 "on": False,
                 "ptt": False,
+                "record": True,
                 "pcm": False,
                 "recording": None,
                 "last": None,
@@ -688,10 +699,10 @@ def test_before_the_link_is_ready_the_switch_stays_off_and_ready_still_asks(tmp_
     """A request sent before the controller reads its requests is lost, and has stalled a real
     controller for good (the lab controller does the same here). Asked for a link that is not
     READY, nothing is sent and nothing is pretended: the endpoint answers 409, and
-    ``--mic-capture on`` asks when the link is READY."""
+    ``--mic on`` asks when the link is READY."""
 
     async def run() -> None:
-        rx = make_receiver(tmp_path, mic_capture="on")
+        rx = make_receiver(tmp_path, mic="on", mic_record=True)
         await rx.start()
         fc = FakeController("127.0.0.1", rx.http.https_port, rx.protos, log=no_log, dtls_role="client",
                             controlling=True, raw_dtls=True, early_rpc="stall")  # fmt: skip
@@ -727,7 +738,7 @@ def test_a_controller_that_refuses_keeps_the_switch_off(tmp_path: Path) -> None:
     again since: then that request's answer is the one that counts."""
 
     async def run() -> None:
-        rx = make_receiver(tmp_path)
+        rx = make_receiver(tmp_path, mic_record=True)
         await rx.start()
         fc = await connect_firmware_flow(rx)
         cs = single(rx)
@@ -770,7 +781,7 @@ def test_the_endpoint_reads_for_anyone_and_switches_for_this_computer(
     this one makes a microphone record."""
 
     async def run() -> None:
-        rx = make_receiver(tmp_path)
+        rx = make_receiver(tmp_path, mic_record=True)
         await rx.start()
         fc = await connect_firmware_flow(rx)
         cs = single(rx)
@@ -795,7 +806,7 @@ def test_the_endpoint_reads_for_anyone_and_switches_for_this_computer(
             assert cs.mic_on is False and "mic_switch" not in rx.log.counts  # the switch was not touched
 
             status, out = await call(fc, rx, "POST", {"do": "on", "on": False})  # on, or not on?
-            assert status == 400 and out == {"error": "do says on or off by itself; on goes with pcm and ptt"}
+            assert status == 400 and out == {"error": "do says on or off by itself; on goes with pcm, ptt and record"}
             assert cs.mic_on is False and "mic_switch" not in rx.log.counts
             status, out = await call(fc, rx, "POST", {"do": "on"})
             assert status == 200 and out == {"ok": True, "on": True, "ticket": cs._rpc_ticket, "controller": "c0"}
@@ -825,7 +836,10 @@ def test_the_endpoint_reads_for_anyone_and_switches_for_this_computer(
             assert status == 200 and cs.mic_ptt is False
 
             status, out = await call(fc, rx, "POST", {"do": "louder"})
-            assert status == 400 and out == {"error": "unknown do='louder'", "actions": ["on", "off", "pcm", "ptt"]}
+            assert status == 400 and out == {
+                "error": "unknown do='louder'",
+                "actions": ["on", "off", "pcm", "ptt", "record"],
+            }
             status, _, raw = await fc.request("POST", "x", "/_mic", b"{not json", "application/json",
                                               port=rx.http.http_ports[0], tls=False)  # fmt: skip
             assert status == 400 and json.loads(raw) == {"error": "the body is not JSON"}
@@ -848,7 +862,7 @@ def test_changing_the_pcm_setting_ends_the_open_recording(tmp_path: Path, monkey
     monkeypatch.setattr(microphone, "ffmpeg_path", lambda: None)  # and no decoder is started here
 
     async def run() -> None:
-        rx = make_receiver(tmp_path)
+        rx = make_receiver(tmp_path, mic_record=True)
         await rx.start()
         fc = await connect_firmware_flow(rx)
         cs = single(rx)
@@ -880,13 +894,13 @@ def test_changing_the_pcm_setting_ends_the_open_recording(tmp_path: Path, monkey
 
 
 def test_push_to_talk_holds_the_switch_with_the_assistant_button(tmp_path: Path) -> None:
-    """``--mic-capture ptt``: pressing the Assistant button turns the microphone on and letting go
+    """``--mic ptt``: pressing the Assistant button turns the microphone on and letting go
     turns it off, each hold a recording of its own. A microphone that was on already is not the
     button's to turn off, one that was turned off during a hold stays off until the next press,
     and a hold ends when the button stops being the switch."""
 
     async def run() -> None:
-        rx = make_receiver(tmp_path, mic_capture="ptt")
+        rx = make_receiver(tmp_path, mic="ptt", mic_record=True)
         await rx.start()
         fc = await connect_firmware_flow(rx)
         cs = single(rx)
@@ -968,7 +982,7 @@ def test_push_to_talk_reads_the_display_links_reports_and_no_others(tmp_path: Pa
     no microphone, and the display link's Assistant button goes on doing so during the game."""
 
     async def run() -> None:
-        rx = make_receiver(tmp_path, mic_capture="ptt", display_rpc_delay=0.05, display_rpc_interval=0.1,
+        rx = make_receiver(tmp_path, mic="ptt", mic_record=True, display_rpc_delay=0.05, display_rpc_interval=0.1,
                            start_game="auto", start_game_delay=0.05)  # fmt: skip
         await rx.start()
         fc = await connect_firmware_flow(rx, game_mode=True, game_framing="raw")
@@ -997,7 +1011,7 @@ def test_push_to_talk_reads_the_display_links_reports_and_no_others(tmp_path: Pa
 
 def test_a_boot_in_the_middle_of_a_hold_forgets_the_hold(tmp_path: Path) -> None:
     async def run() -> None:
-        rx = make_receiver(tmp_path, mic_capture="ptt")
+        rx = make_receiver(tmp_path, mic="ptt", mic_record=True)
         await rx.start()
         fc = await connect_firmware_flow(rx)
         cs = single(rx)
@@ -1023,9 +1037,9 @@ def test_a_boot_in_the_middle_of_a_hold_forgets_the_hold(tmp_path: Path) -> None
     asyncio.run(run())
 
 
-def test_mic_capture_on_asks_once_per_boot_and_a_new_boot_ends_the_recording(tmp_path: Path) -> None:
+def test_mic_on_asks_once_per_boot_and_a_new_boot_ends_the_recording(tmp_path: Path) -> None:
     async def run() -> None:
-        rx = make_receiver(tmp_path, mic_capture="on")
+        rx = make_receiver(tmp_path, mic="on", mic_record=True)
         await rx.start()
         fc = await connect_firmware_flow(rx)
         cs = single(rx)
@@ -1072,7 +1086,7 @@ def test_a_request_the_controller_does_not_answer_is_sent_again(
     monkeypatch.setattr("stadiacast.controller.MIC_ANSWER_TIMEOUT", 0.1)
 
     async def run() -> None:
-        rx = make_receiver(tmp_path)
+        rx = make_receiver(tmp_path, mic_record=True)
         await rx.start()
         fc = await connect_firmware_flow(rx)
         cs = single(rx)
@@ -1131,7 +1145,7 @@ def test_sound_nobody_asked_for_gets_no_file_and_the_controller_is_told_to_stop(
     monkeypatch.setattr("stadiacast.controller.MIC_ANSWER_TIMEOUT", 0.05)
 
     async def run() -> None:
-        rx = make_receiver(tmp_path)
+        rx = make_receiver(tmp_path, mic_record=True)
         await rx.start()
         fc = await connect_firmware_flow(rx)
         cs = single(rx)
@@ -1174,7 +1188,7 @@ def test_stopping_the_receiver_tells_the_controller_to_stop(tmp_path: Path) -> N
     receiver that is gone."""
 
     async def run() -> None:
-        rx = make_receiver(tmp_path, mic_capture="on")
+        rx = make_receiver(tmp_path, mic="on", mic_record=True)
         await rx.start()
         fc = await connect_firmware_flow(rx)
         cs = single(rx)
@@ -1199,7 +1213,7 @@ def test_stopping_the_receiver_tells_the_controller_to_stop(tmp_path: Path) -> N
 
 def test_a_controller_switched_off_ends_its_recording(tmp_path: Path) -> None:
     async def run() -> None:
-        rx = make_receiver(tmp_path)
+        rx = make_receiver(tmp_path, mic_record=True)
         await rx.start()
         fc = await connect_firmware_flow(rx)
         cs = single(rx)
@@ -1224,7 +1238,7 @@ def test_a_controller_switched_off_ends_its_recording(tmp_path: Path) -> None:
 
 def test_two_controllers_record_into_two_files(tmp_path: Path) -> None:
     async def run() -> None:
-        rx = make_receiver(tmp_path)
+        rx = make_receiver(tmp_path, mic_record=True)
         await rx.start()
         a = await connect_firmware_flow(rx, device_id="fake-a", cloud_device_id="cloud-fake-a")
         b = await connect_firmware_flow(rx, device_id="fake-b", cloud_device_id="cloud-fake-b")
@@ -1267,7 +1281,7 @@ def test_a_run_directory_that_takes_no_file_switches_the_microphone_off(
     monkeypatch.setattr("stadiacast.controller.capture_path", lambda _run_dir, _label: str(tmp_path / "gone" / "m.ogg"))
 
     async def run() -> None:
-        rx = make_receiver(tmp_path)
+        rx = make_receiver(tmp_path, mic_record=True)
         await rx.start()
         fc = await connect_firmware_flow(rx)
         cs = single(rx)
@@ -1295,7 +1309,7 @@ def test_a_disk_that_refuses_ends_the_recording_and_not_the_link(tmp_path: Path)
             raise OSError(28, "No space left on device")
 
     async def run() -> None:
-        rx = make_receiver(tmp_path)
+        rx = make_receiver(tmp_path, mic_record=True)
         await rx.start()
         fc = await connect_firmware_flow(rx)
         cs = single(rx)
@@ -1330,7 +1344,7 @@ def test_stopping_the_receiver_sees_the_recording_and_its_decoder_out(tmp_path: 
     packets = real_opus(0.4)
 
     async def run() -> None:
-        rx = make_receiver(tmp_path, mic_capture="on", mic_pcm=True)
+        rx = make_receiver(tmp_path, mic="on", mic_record=True, mic_pcm=True)
         await rx.start()
         fc = await connect_firmware_flow(rx)
         cs = single(rx)

@@ -17,8 +17,8 @@ DEFAULT_CONTROLLER_IP = "192.168.2.2"
 #: The libopus ``-application`` values the headset stream offers: ``lowdelay`` for games (the
 #: shortest encoder delay), ``audio`` for music (the best quality at the bitrate).
 AUDIO_APPLICATIONS: tuple[str, ...] = ("lowdelay", "audio")
-#: ``--mic-capture``: never, from READY, or while the Assistant button is held.
-MIC_CAPTURE_MODES: tuple[str, ...] = ("off", "on", "ptt")
+#: ``--mic``: never, from READY, or while the Assistant button is held.
+MIC_MODES: tuple[str, ...] = ("off", "on", "ptt")
 
 
 @dataclass
@@ -82,9 +82,13 @@ class Config:
     audio_volume: float = 1.0  # linear gain before encoding (above 1 a limiter guards against clipping)
     audio_follow_volume: bool = True  # Windows: scale the loopback capture by the volume slider (False: before it)
 
-    # -- the controller's microphone, recorded into the run directory -------------------------
-    mic_capture: str = "off"  # off | on (from READY) | ptt (while the Assistant button is held)
-    mic_pcm: bool = False  # decode each recording to s16le PCM as well, with ffmpeg
+    # -- the controller's microphone -----------------------------------------------------------
+    mic: str = "off"  # when it is on: off | on (from READY) | ptt (while the Assistant button is held)
+    # A microphone of this computer: None for none, "" for the system's own way (a device the
+    # receiver makes on Linux, VB-CABLE on Windows, a loopback device on macOS), or a device's name.
+    mic_device: str | None = None
+    mic_record: bool = False  # recorded into Ogg files in the run directory
+    mic_pcm: bool = False  # with mic_record: each recording decoded to s16le PCM as well, with ffmpeg
 
     # -- virtual gamepad (the input as a pad on this PC) -----------------------------------
     # off | vigem (Windows) | ojd (macOS) | uinput (Linux, Xbox 360 pad) | uhid (Linux, Stadia Controller);
